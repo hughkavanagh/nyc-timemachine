@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s -L -o /tmp/preservica_manhattan.html -w \"HTTP %{http_code}\\\\nFinal URL: %{url_effective}\\\\nSize: %{size_download}\\\\n\" \"https://nycrecords.access.preservica.com/uncategorized/SO_e6e79554-4227-414f-afc2-5f008fb9c96b/\")",
+      "Bash(curl -s -L -o /tmp/1940s_nyc_home.html -w \"HTTP %{http_code}\\\\nSize: %{size_download}\\\\n\" \"https://1940s.nyc\")",
+      "Bash(grep -oE 'page-numbers[^>]*>[^<]{0,50}' /tmp/preservica_manhattan.html)",
+      "Bash(curl -s -L \"https://nycrecords.access.preservica.com/uncategorized/IO_07ea78aa-f038-481a-a125-6e6be856500c/\" -o /tmp/preservica_item.html -w \"HTTP %{http_code} Size %{size_download}\\\\n\")",
+      "Bash(grep -oE '\\(address|Address|block|Block|lot|Lot|borough|Borough|street|Street|date|Date|1940|title|Title\\)[^<>]{0,100}' /tmp/preservica_item.html)",
+      "Bash(grep -oE '<\\(h1|h2|title\\)[^>]*>[^<]{0,200}' /tmp/preservica_item.html)",
+      "Bash(grep -oE 'metadata[^<>]{0,200}' /tmp/preservica_item.html)",
+      "Bash(grep -oE '\\(description|subject|identifier|coverage|creator|spatial|temporal\\)[^<>]{0,200}' /tmp/preservica_item.html)",
+      "Bash(grep -oE 'metadata-\\(title|entry\\)\"[^<>]*>[^<]{0,200}' /tmp/preservica_item.html)",
+      "Bash(curl -sI -L \"https://nycrecords.access.preservica.com/download/file/IO_07ea78aa-f038-481a-a125-6e6be856500c\")",
+      "Bash(python3)",
+      "Bash(curl -s -o /dev/null -w '%{http_code}' 'https://nycrecords.access.preservica.com/__TRACKED_VAR__?verb=Identify')",
+      "WebSearch",
+      "Bash(python3 -m venv .venv)",
+      "Bash(.venv/bin/pip install:*)",
+      "Bash(.venv/bin/python -c \"import httpx; print\\('httpx', httpx.__version__\\)\")",
+      "Bash(.venv/bin/python scrape/scrape_listings.py --borough manhattan --pages 1-3 --concurrency 2)",
+      "Bash(curl -s \"https://nycrecords.access.preservica.com/robots.txt\" -w \"\\\\n--- HTTP %{http_code} ---\\\\n\")",
+      "Bash(curl -s -o /tmp/probe.out -w '%{http_code}' -H 'User-Agent: Mozilla/5.0 \\(Macintosh; Intel Mac OS X 10_15_7\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/120.0.0.0 Safari/537.36' https://nycrecords.access.preservica.com/__TRACKED_VAR__)",
+      "Bash(curl -s -o /tmp/p1 -w '%{http_code}\\\\n' -H 'User-Agent: Mozilla/5.0 \\(Macintosh; Intel Mac OS X 10_15_7\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/120.0 Safari/537.36' 'https://nycrecords.access.preservica.com/api/oai?verb=Identify')",
+      "Bash(curl -s -o /tmp/p2 -w '%{http_code}\\\\n' -H 'User-Agent: Mozilla/5.0 \\(Macintosh; Intel Mac OS X 10_15_7\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/120.0 Safari/537.36' 'https://nycrecords.access.preservica.com/oai?verb=Identify')",
+      "Bash(curl -s -o /tmp/p3 -w '%{http_code}\\\\n' -H 'User-Agent: Mozilla/5.0 \\(Macintosh; Intel Mac OS X 10_15_7\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/120.0 Safari/537.36' https://nycrecords.access.preservica.com/api/entity/root/children)",
+      "Read(//tmp/**)",
+      "Bash(.venv/bin/python scrape/scrape_listings.py --borough manhattan --pages 1-3 --concurrency 2 --delay 0.5)",
+      "Bash(.venv/bin/python -c ':*)",
+      "Bash(curl -s -o /dev/null -w \"curl still works: %{http_code} size=%{size_download}\\\\n\" 'https://nycrecords.access.preservica.com/uncategorized/SO_e6e79554-4227-414f-afc2-5f008fb9c96b/?pg=2')",
+      "Bash(.venv/bin/python -c \"from curl_cffi import requests; r = requests.get\\('https://nycrecords.access.preservica.com/uncategorized/SO_e6e79554-4227-414f-afc2-5f008fb9c96b/?pg=2', impersonate='chrome'\\); print\\('curl_cffi chrome:', r.status_code, 'size', len\\(r.content\\)\\)\")",
+      "Bash(time .venv/bin/python scrape/scrape_listings.py --borough manhattan --pages 4-23 --concurrency 5 --delay 0.3)",
+      "Bash(nohup .venv/bin/python scrape/scrape_listings.py --borough all --concurrency 5 --delay 0.3)",
+      "Bash(echo \"Started PID $!\")",
+      "Bash(.venv/bin/python -c \" import sqlite3 c = sqlite3.connect\\('data/nyc_photos.sqlite'\\) print\\('photos:', c.execute\\('SELECT COUNT\\(*\\) FROM photos'\\).fetchone\\(\\)[0]\\) for r in c.execute\\('SELECT borough_code, COUNT\\(*\\) AS pages, MAX\\(page\\) AS last FROM scrape_progress GROUP BY borough_code ORDER BY borough_code'\\): print\\('borough', r[0], ': pages done =', r[1], ', highest page =', r[2]\\) \")",
+      "WebFetch(domain:www.nyc.gov)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git -c user.name=local -c user.email=local@local commit -q -m \"initial: Phase 1 scraper \\(curl_cffi, sqlite, resumable\\)\")"
+    ]
+  }
+}
