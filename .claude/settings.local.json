@@ -35,7 +35,11 @@
       "WebFetch(domain:www.nyc.gov)",
       "Bash(git init:*)",
       "Bash(git add:*)",
-      "Bash(git -c user.name=local -c user.email=local@local commit -q -m \"initial: Phase 1 scraper \\(curl_cffi, sqlite, resumable\\)\")"
+      "Bash(git -c user.name=local -c user.email=local@local commit -q -m \"initial: Phase 1 scraper \\(curl_cffi, sqlite, resumable\\)\")",
+      "Bash(ps -p 16094 -o pid,etime,rss,state)",
+      "Bash(curl -s -o /tmp/sod.json -w '%{http_code}' 'https://data.cityofnewyork.us/resource/__TRACKED_VAR__.json?$limit=1')",
+      "Bash(curl -s 'https://data.cityofnewyork.us/resource/64uk-42ks.json?$limit=1&$select=bbl,borough,block,lot,address,latitude,longitude,lotarea,yearbuilt')",
+      "Bash(curl -s 'https://data.cityofnewyork.us/resource/64uk-42ks.json?$select=count\\(*\\)')"
     ]
   }
 }

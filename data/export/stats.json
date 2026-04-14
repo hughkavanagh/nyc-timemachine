@@ -1,0 +1,15 @@
+{
+  "generated_at": 1776192424,
+  "total_photos_scraped": 104907,
+  "unique_bbls": 90522,
+  "placed_bbls": 83873,
+  "match_breakdown": {
+    "block_nearest_lot": 42206,
+    "lot": 54985,
+    "none": 7716
+  },
+  "scrape_pages_done": {
+    "1": 3531,
+    "2": 913
+  }
+}
