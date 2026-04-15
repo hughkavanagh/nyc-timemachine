@@ -180,11 +180,16 @@ function colIdx() {
   return Object.fromEntries(index.columns.map((c, i) => [c, i]));
 }
 
-// Radius (m) inside which we look at neighboring buildings to infer which
-// street the user is ON. 35 m easily covers both sides of an NYC street
-// (most are 15–25 m wide curb-to-curb) without bleeding into buildings on
-// the next parallel avenue.
-const USER_STREET_RADIUS_M = 35;
+// Max physical distance (m) of the SINGLE closest building — used as the
+// anchor for determining "what street am I on". If the closest building is
+// further than this, we're probably in a park or plaza; skip the filter.
+const USER_STREET_ANCHOR_MAX_M = 50;
+// Extension (m) past the closest building's distance in which other streets
+// are allowed to count as "the user's street". 12 m is tighter than the
+// distance from one side of an SoHo street to the other (~20 m) — so
+// standing mid-Mercer can't vote for Broadway, but actual corner positions
+// where two adjacent parcels face different streets still register both.
+const USER_STREET_EXTEND_M  = 12;
 
 /**
  * Extract a street name from a MapPLUTO-style address like "123 PRINCE ST"
@@ -239,37 +244,41 @@ function extractStreet(addr) {
  */
 function pickScene(lat, lon, hdg) {
   const c = colIdx();
-  // First pass: collect candidates AND tally which streets are within the
-  // "user is on this street" radius. One loop; keeping both passes folded
-  // together so we don't iterate 561k rows twice per scan.
+  // First pass: collect candidates within the outer neighbor radius.
   const cands = [];
-  const streetTally = new Map(); // streetName -> count within USER_STREET_RADIUS_M
   for (const r of index.data) {
     const plat = r[c.lat], plon = r[c.lon];
     const d = distMeters(lat, lon, plat, plon);
     if (d > NEIGHBOR_DIST_M) continue;
     const b = bearingDeg(lat, lon, plat, plon);
     cands.push({ row: r, d, b });
-    if (d <= USER_STREET_RADIUS_M) {
-      const s = extractStreet(r[c.addr]);
-      if (s) streetTally.set(s, (streetTally.get(s) || 0) + 1);
-    }
   }
   if (!cands.length) return null;
 
-  // Determine the user's "street set". If one street dominates, use only it.
-  // If two streets are comparably represented (user at a corner), keep both.
-  // No street data nearby → skip the filter (be lenient, show the best we have).
+  // Anchor the "user's street" on the SINGLE closest building. Earlier we
+  // tallied hits within 35 m — but at 35 m mid-Mercer catches Broadway
+  // parcels across the block and ties let them through. Anchoring on the
+  // closest building + extending only ~12 m past that distance removes
+  // that failure mode. A true corner still works: the 4 corner buildings
+  // (two on each street) all sit within 10-20 m of each other.
+  const sortedByDist = cands.slice().sort((a, b) => a.d - b.d);
   let userStreetSet = null;
-  if (streetTally.size > 0) {
-    const ranked = [...streetTally.entries()].sort((a, b) => b[1] - a[1]);
-    const top = ranked[0][1];
-    // Keep streets with at least half the top count (min 2 hits to count as
-    // a "real" cross-street — one stray parcel shouldn't unlock an avenue).
-    const keep = ranked.filter(([, n]) => n === top || n >= Math.max(2, top / 2))
-                       .slice(0, 2)
-                       .map(([s]) => s);
-    userStreetSet = new Set(keep);
+  if (sortedByDist[0].d <= USER_STREET_ANCHOR_MAX_M) {
+    const d0 = sortedByDist[0].d;
+    const base = extractStreet(sortedByDist[0].row[c.addr]);
+    const streets = new Set();
+    if (base) streets.add(base);
+    // Include streets represented by any building within d0 + 12 m. In
+    // practice that's "same block face" mid-block, or "two adjacent corner
+    // lots" at an intersection.
+    const cutoff = d0 + USER_STREET_EXTEND_M;
+    for (let i = 1; i < sortedByDist.length; i++) {
+      if (sortedByDist[i].d > cutoff) break;
+      const s = extractStreet(sortedByDist[i].row[c.addr]);
+      if (s) streets.add(s);
+      if (streets.size >= 2) break; // NYC corners are 2 streets, not more
+    }
+    if (streets.size > 0) userStreetSet = streets;
   }
 
   // Dedupe by BBL (keep closest photo per BBL).
@@ -305,6 +314,20 @@ function pickScene(lat, lon, hdg) {
   forward.sort((a, b) => a.ang - b.ang);
   if (!forward.length) return null;
 
+  // "Pointing anchor": the building directly ahead on the user's ray,
+  // regardless of corridor. Used by the bottom card so its address stays
+  // visible even in peek mode (no photo in corridor). We pick smallest
+  // forward distance — i.e. the first building your ray hits.
+  let anchorCand = null;
+  for (const x of forward) {
+    if (!anchorCand || x.fwd < anchorCand.fwd) anchorCand = x;
+  }
+  const pointingAnchor = anchorCand ? rowToPhoto(anchorCand.row, c, {
+    distance: anchorCand.d,
+    offset:   Math.abs(anchorCand.ang),
+    bearing:  anchorCand.b,
+  }) : null;
+
   // Corridor pick: closest forward building within a perpendicular half-width.
   const pickInCorridor = (perpHalfwidth, maxFwd) => {
     let bestIdx = -1, bestFwd = Infinity;
@@ -336,6 +359,7 @@ function pickScene(lat, lon, hdg) {
       prev:    makeHit(bestIdx - 1),
       current: makeHit(bestIdx),
       next:    makeHit(bestIdx + 1),
+      pointingAnchor,
     };
   }
 
@@ -351,8 +375,8 @@ function pickScene(lat, lon, hdg) {
   }
   const peekLeft  = nearestLeft  ? makeHit(forward.indexOf(nearestLeft))  : null;
   const peekRight = nearestRight ? makeHit(forward.indexOf(nearestRight)) : null;
-  if (!peekLeft && !peekRight) return null;
-  return { mode: "peek", peekLeft, peekRight };
+  if (!peekLeft && !peekRight && !pointingAnchor) return null;
+  return { mode: "peek", peekLeft, peekRight, pointingAnchor };
 }
 
 /** Fallback: nearest-in-any-direction (for "turn around" hint). */
@@ -422,6 +446,7 @@ const SLOT_CLASSES = [
   "slot-left", "slot-center", "slot-right",
   "slot-far-left", "slot-far-right", "slot-exit",
   "slot-peek-left", "slot-peek-right",
+  "slot-enter-center",
 ];
 
 function hideEmptyHint() { emptyHint.hidden = true; }
@@ -429,26 +454,29 @@ function showEmptyHint(text) { emptyHint.textContent = text; emptyHint.hidden = 
 
 /**
  * Pick the entry class for a NEW slide appearing in `role`.
- * Slides that have a natural side (left/right, peek-left/peek-right) enter
- * from that side. Center slides enter from the direction of the user's
- * last turn.
+ * Side-anchored slides (left/right, peek-left/peek-right) enter from their
+ * own far-side. Center slides fade in AT the center — never slide in from
+ * the side — because the user's requested behavior is that images always
+ * be centered and "load in from the center", regardless of which way the
+ * phone is turning.
  */
-function entryClassFor(role, turnDir) {
+function entryClassFor(role /*, turnDir */) {
   if (role === "left"  || role === "peek-left")  return "slot-far-left";
   if (role === "right" || role === "peek-right") return "slot-far-right";
-  // role === "center" — enter from the turn direction.
-  return turnDir === "left" ? "slot-far-left" : "slot-far-right";
+  // role === "center" — fade in at center, scaled slightly down.
+  return "slot-enter-center";
 }
 
 /**
  * Pick the exit class for a slide LEAVING `oldRole`. Side-anchored slides
- * exit toward their own side. A stale center exits OPPOSITE to the current
- * turn direction (turning right → old center slides off to the left).
+ * exit toward their own side. A stale CENTER slide fades out at the
+ * center (same symmetry as the entry) — it does not slide off to a side.
  */
-function exitClassFor(oldRole, turnDir) {
+function exitClassFor(oldRole /*, turnDir */) {
   if (oldRole === "left"  || oldRole === "peek-left")  return "slot-far-left";
   if (oldRole === "right" || oldRole === "peek-right") return "slot-far-right";
-  return turnDir === "right" ? "slot-far-left" : "slot-far-right";
+  // oldRole === "center" — fade/shrink at center, via slot-exit.
+  return "slot-exit";
 }
 
 /**
@@ -520,13 +548,20 @@ function renderScene(scene) {
     }
   }
 
-  // 3. Bottom chrome + overlay hint.
+  // 3. Bottom chrome + overlay hint. The bottom card is ALWAYS visible —
+  // it shows the address of what the user is pointing at whether or not
+  // we have a photo for it. In peek mode we also flag the card as
+  // "approximate" so the sub-text makes the no-photo state explicit.
   if (scene.mode === "trio" && scene.current) {
     hideEmptyHint();
     updateBottomCard(scene.current);
   } else if (scene.mode === "peek") {
-    // No building directly ahead — tell the user to turn.
-    bottomCard.hidden = true;
+    const anchor = scene.pointingAnchor ?? scene.peekLeft ?? scene.peekRight;
+    if (anchor) updateBottomCard(anchor, { noPhotoHere: true });
+    else        bottomCard.hidden = true;
+
+    // Empty-state hint in the middle of the frame — tells the user which
+    // way to turn to find the nearest actual photo.
     const l = scene.peekLeft, r = scene.peekRight;
     let hint;
     if (l && r) {
@@ -535,8 +570,10 @@ function renderScene(scene) {
       hint = `No 1940s photo directly ahead.\nTurn ${leftCloser ? "left" : "right"} — a photo is ~${Math.round(near.distance)} m away.`;
     } else if (l) {
       hint = `No 1940s photo directly ahead.\nTurn left — a photo is ~${Math.round(l.distance)} m away.`;
-    } else {
+    } else if (r) {
       hint = `No 1940s photo directly ahead.\nTurn right — a photo is ~${Math.round(r.distance)} m away.`;
+    } else {
+      hint = `No 1940s photo directly ahead.`;
     }
     showEmptyHint(hint);
   }
@@ -633,18 +670,40 @@ function clearAllSlides() {
   slideRegistry.clear();
 }
 
-function updateBottomCard(hit) {
-  if (hit.bbl !== lastBbl) {
+/**
+ * Populate the bottom card with `hit`'s address + distance.
+ *
+ * `opts.noPhotoHere`: set when the card is showing the anchor address in
+ * peek mode — i.e. we know the building the user is pointing at, but we
+ * have no photo for it, so the sub-line reads "No 1940s photo here" and
+ * the alts strip is hidden. In that mode we deliberately do NOT reset
+ * currentIoIdx on bbl changes, since the "hit" is an anchor, not an
+ * actual photo the user is tapping through.
+ */
+function updateBottomCard(hit, opts = {}) {
+  const { noPhotoHere = false } = opts;
+
+  if (!noPhotoHere && hit.bbl !== lastBbl) {
     currentIoIdx = 0;
     lastBbl = hit.bbl;
   }
-  const extra = alts[hit.bbl] ?? [];
-  const ids = [stripIo(hit.io), ...extra];
 
   bottomCard.hidden = false;
   addrText.textContent = hit.addr ?? "Unknown address";
+
+  if (noPhotoHere) {
+    subText.innerHTML = `No 1940s photo here${manualOverride ? manualChipHtml() : ""}`;
+    wireManualChipReset();
+    altsHintEl.hidden = true;
+    altsStrip.innerHTML = "";
+    return;
+  }
+
   subText.innerHTML = `${hit.distance.toFixed(0)} m away${manualOverride ? manualChipHtml() : ""}`;
   wireManualChipReset();
+
+  const extra = alts[hit.bbl] ?? [];
+  const ids = [stripIo(hit.io), ...extra];
 
   if (ids.length > 1) {
     altsHintEl.hidden = false;

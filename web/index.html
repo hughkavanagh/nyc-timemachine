@@ -60,14 +60,11 @@
     .slide a { position: relative; display: block; width: 100%; }
     .slide img { width: 100vw; height: auto; display: block; }
 
-    /* Peek roles: dimmed to ~20% (≈ 80% black overlay) + subtle blur. */
-    .slide.slot-left {
-      transform: translateX(-58%) scale(0.72);
-      filter: brightness(0.22) blur(3px);
-      opacity: 1;
-      z-index: 1;
-      pointer-events: none;
-    }
+    /* The focal image is always centered at full size.
+       Every other slide — the ang-neighbor peeks in trio mode and the
+       "turn this way" peeks in peek mode — is a thin 13% sliver at the
+       edge. Keeping a single sliver-style for all non-center slides makes
+       the main image unambiguously the focal one. */
     .slide.slot-center {
       transform: translateX(0) scale(1);
       filter: none;
@@ -75,39 +72,11 @@
       z-index: 3;
       pointer-events: auto;
     }
-    .slide.slot-right {
-      transform: translateX(58%) scale(0.72);
-      filter: brightness(0.22) blur(3px);
-      opacity: 1;
-      z-index: 1;
-      pointer-events: none;
-    }
-    /* Entry states — slides start offscreen and animate to their role. */
-    .slide.slot-far-left {
-      transform: translateX(-130%) scale(0.6);
-      filter: brightness(0.1) blur(6px);
-      opacity: 0;
-      z-index: 0;
-    }
-    .slide.slot-far-right {
-      transform: translateX(130%) scale(0.6);
-      filter: brightness(0.1) blur(6px);
-      opacity: 0;
-      z-index: 0;
-    }
-    /* Exit state — slide fades/shrinks out in place before being removed. */
-    .slide.slot-exit {
-      opacity: 0;
-      transform: scale(0.55);
-      filter: brightness(0.1) blur(6px);
-      z-index: 0;
-    }
-    /* Peek slivers — used when no building is "in front" but photos exist
-       to the side. We show only a ~13% strip of the image at the screen
-       edge so the user can see which direction to turn.
-       translateX(-87%) on a 100vw image leaves 13vw visible on the LEFT
+    /* translateX(-87%) on a 100vw image leaves 13vw visible on the LEFT
        of the screen, showing the RIGHT edge of the photo — the part of
-       the building nearest to where the user is pointing. */
+       the building nearest to where the user is pointing. Used for both
+       the trio's ang-previous AND "turn left to find a photo" peeks. */
+    .slide.slot-left,
     .slide.slot-peek-left {
       transform: translateX(-87%) scale(1);
       filter: brightness(0.5) blur(1px);
@@ -115,12 +84,45 @@
       z-index: 2;
       pointer-events: none;
     }
+    .slide.slot-right,
     .slide.slot-peek-right {
       transform: translateX(87%) scale(1);
       filter: brightness(0.5) blur(1px);
       opacity: 1;
       z-index: 2;
       pointer-events: none;
+    }
+    /* Side entry states — a sliver peek that's new to the DOM starts
+       fully offscreen and slides in to its edge position. */
+    .slide.slot-far-left {
+      transform: translateX(-130%) scale(1);
+      filter: brightness(0.1) blur(6px);
+      opacity: 0;
+      z-index: 0;
+    }
+    .slide.slot-far-right {
+      transform: translateX(130%) scale(1);
+      filter: brightness(0.1) blur(6px);
+      opacity: 0;
+      z-index: 0;
+    }
+    /* Center entry — a new focal photo fades in AT the center (not from
+       the side). Starts slightly scaled-down + blurred, animates to 1.0.
+       This matches the user-visible contract: "the photo for what I'm
+       pointing at always appears centered". */
+    .slide.slot-enter-center {
+      transform: translateX(0) scale(0.92);
+      filter: brightness(0.4) blur(6px);
+      opacity: 0;
+      z-index: 3;
+    }
+    /* Exit state — slide fades/shrinks out in place before being removed.
+       Used for the stale center when the carousel moves on. */
+    .slide.slot-exit {
+      opacity: 0;
+      transform: translateX(0) scale(0.55);
+      filter: brightness(0.1) blur(6px);
+      z-index: 0;
     }
 
     /* Shimmer overlay shown while full-res is loading behind a thumbnail. */
