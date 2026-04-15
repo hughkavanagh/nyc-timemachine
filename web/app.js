@@ -34,6 +34,8 @@ const FULL_BASE  = "https://nycrecords.access.preservica.com/download/file";
 
 const CONE_DEG   = 22;    // half-angle considered "pointed at"
 const MAX_DIST_M = 120;   // max range for candidate buildings (dense NYC)
+const NEIGHBOR_DIST_M = 160; // wider range for the prev/next peeks
+const NEIGHBOR_ANG_DEG = 90; // prev/next must lie within ±90° of heading
 const ANGLE_WEIGHT = 2.5; // ranking weight: 1° misalignment ≈ 2.5 m
 
 // Map tile style. OpenFreeMap is free, no API key, attribution baked in.
@@ -92,8 +94,6 @@ const el = (id) => document.getElementById(id);
 const photoWrap     = el("photoWrap");
 const emptyHint     = el("emptyHint");
 const topPill       = el("topPill");
-const compass       = el("compass");
-const compassSvg    = el("compassSvg");
 const bottomCard    = el("bottomCard");
 const addrText      = el("addrText");
 const subText       = el("subText");
@@ -161,24 +161,72 @@ function colIdx() {
   return Object.fromEntries(index.columns.map((c, i) => [c, i]));
 }
 
-/** Return best-aligned photo within the view cone, or null. */
-function pickTarget(lat, lon, hdg) {
+/**
+ * Pick up to three adjacent-by-bearing candidates around the user's heading:
+ *   - current: best-scored candidate within the view cone
+ *   - prev:    the building at the next-lower bearing (peek on the left)
+ *   - next:    the building at the next-higher bearing (peek on the right)
+ *
+ * Returns null if nothing lies in the view cone. Previous/next can be null
+ * individually if there's nothing on that side.
+ *
+ * Deduped by BBL so two photos of the same building (alts) don't eat the
+ * prev/next slots — alts still live inside the bottom-card strip.
+ */
+function pickTrio(lat, lon, hdg) {
   const c = colIdx();
-  let best = null;
+  // First pass: buildings within a slightly expanded radius for peeks.
+  const cands = [];
   for (const r of index.data) {
     const plat = r[c.lat], plon = r[c.lon];
     const d = distMeters(lat, lon, plat, plon);
-    if (d > MAX_DIST_M) continue;
+    if (d > NEIGHBOR_DIST_M) continue;
     const b = bearingDeg(lat, lon, plat, plon);
-    const off = Math.abs(angleDiff(b, hdg));
-    if (off > CONE_DEG) continue;
-    const score = d + ANGLE_WEIGHT * off;
-    if (!best || score < best.score) {
-      best = { score, d, off, bearing: b, row: r, col: c };
-    }
+    cands.push({ row: r, d, b });
   }
-  if (!best) return null;
-  return rowToPhoto(best.row, best.col, { distance: best.d, offset: best.off, bearing: best.bearing });
+  if (!cands.length) return null;
+
+  // Dedupe by BBL (keep closest photo per BBL).
+  const perBbl = new Map();
+  for (const x of cands) {
+    const bbl = x.row[c.bbl];
+    const existing = perBbl.get(bbl);
+    if (!existing || x.d < existing.d) perBbl.set(bbl, x);
+  }
+  const uniq = Array.from(perBbl.values());
+
+  // Signed angle from heading; keep only the forward half so buildings
+  // behind the user don't count as "prev/next".
+  for (const x of uniq) x.ang = angleDiff(x.b, hdg);
+  const window = uniq.filter(x => Math.abs(x.ang) <= NEIGHBOR_ANG_DEG);
+  window.sort((a, b) => a.ang - b.ang);
+  if (!window.length) return null;
+
+  // Pick current = best-scoring building within the view cone.
+  let bestIdx = -1, bestScore = Infinity;
+  for (let i = 0; i < window.length; i++) {
+    const x = window[i];
+    const absA = Math.abs(x.ang);
+    if (absA > CONE_DEG) continue;
+    if (x.d > MAX_DIST_M) continue;
+    const s = x.d + ANGLE_WEIGHT * absA;
+    if (s < bestScore) { bestScore = s; bestIdx = i; }
+  }
+  if (bestIdx < 0) return null; // nothing in cone
+
+  const make = (i) => i >= 0 && i < window.length
+    ? rowToPhoto(window[i].row, c, {
+        distance: window[i].d,
+        offset: Math.abs(window[i].ang),
+        bearing: window[i].b,
+      })
+    : null;
+
+  return {
+    prev:    make(bestIdx - 1),
+    current: make(bestIdx),
+    next:    make(bestIdx + 1),
+  };
 }
 
 /** Fallback: nearest-in-any-direction (for "turn around" hint). */
@@ -208,71 +256,164 @@ function rowToPhoto(row, c, extra = {}) {
   };
 }
 
-// ---------- Rendering ----------
+// ---------- Rendering (3-slide carousel) ----------
+//
+// slideRegistry maps io -> { el, hasFullRes } for every slide currently in
+// the DOM. On each scan we compute the desired trio (prev/current/next),
+// then reconcile:
+//   - Slides no longer in the trio get the .slot-exit class and are
+//     removed 400 ms later, after the CSS transition fades them out.
+//   - Desired slides that aren't in the registry are freshly appended.
+//     They START with .slot-far-left or .slot-far-right so the first
+//     frame paints them offscreen; a forced reflow, then the real role
+//     class, lets CSS animate them into position.
+//   - Existing slides just get their role class swapped — CSS handles
+//     the transform/filter interpolation.
+//
+// This persistent-DOM approach is what makes the transitions smooth: a
+// building that was "next" and becomes "center" has the SAME DOM node, so
+// the transition fires on a class change rather than a node replacement.
+
 let lastBbl = null;
+const slideRegistry = new Map(); // io -> { el, hasFullRes }
 
-function hideEmptyHint() {
-  emptyHint.hidden = true;
-}
+function hideEmptyHint() { emptyHint.hidden = true; }
+function showEmptyHint(text) { emptyHint.textContent = text; emptyHint.hidden = false; }
 
-function showEmptyHint(text) {
-  emptyHint.textContent = text;
-  emptyHint.hidden = false;
-}
-
-function renderTarget(hit) {
+function renderTrio(trio) {
   hideEmptyHint();
-  // If BBL changed, reset alt cycling.
+  photoWrap.classList.remove("empty");
+
+  // Build desired state: io -> role.
+  const desired = new Map();
+  if (trio.prev)    desired.set(trio.prev.io,    { role: "left",   hit: trio.prev });
+  if (trio.current) desired.set(trio.current.io, { role: "center", hit: trio.current });
+  if (trio.next)    desired.set(trio.next.io,    { role: "right",  hit: trio.next });
+
+  // 1. Remove slides that are no longer desired — fade them out.
+  for (const [io, sl] of slideRegistry) {
+    if (desired.has(io)) continue;
+    sl.el.classList.remove("slot-left", "slot-center", "slot-right");
+    sl.el.classList.add("slot-exit");
+    const { el } = sl;
+    setTimeout(() => el.remove(), 400);
+    slideRegistry.delete(io);
+  }
+
+  // 2. Add or update desired slides.
+  for (const [io, { role, hit }] of desired) {
+    let sl = slideRegistry.get(io);
+    if (!sl) {
+      const el = createSlideEl(hit, role);
+      // Enter from offscreen, then animate into role position.
+      const entry = role === "left" ? "slot-far-left" : "slot-far-right";
+      el.classList.add(entry);
+      photoWrap.appendChild(el);
+      // Force layout so the browser registers the "far" position before
+      // the transition to the real role class fires.
+      void el.offsetWidth;
+      el.classList.remove(entry);
+      sl = { el, hasFullRes: false };
+      slideRegistry.set(io, sl);
+    }
+    // Assign/swap role class — CSS transition animates the move.
+    sl.el.classList.remove("slot-left", "slot-center", "slot-right", "slot-far-left", "slot-far-right", "slot-exit");
+    sl.el.classList.add(`slot-${role}`);
+
+    // Only the center slide bothers with full-res — side peeks are
+    // blurred+dimmed, thumbnail quality is invisible there. When a slide
+    // transitions into center, upgrade its src to full.
+    if (role === "center" && !sl.hasFullRes) {
+      upgradeToFullRes(sl, hit);
+    }
+  }
+
+  // 3. Bottom card follows the center slide.
+  if (trio.current) updateBottomCard(trio.current);
+}
+
+function createSlideEl(hit, role) {
+  const io = hit.io;
+  const thumbUrl = `${THUMB_BASE}/${io}?fallback-thumbnail=1`;
+  const fullUrl  = `${FULL_BASE}/${io}`;
+  const cached   = recentFullSet.has(fullUrl);
+
+  const el = document.createElement("div");
+  el.className = "slide";
+  el.dataset.io = io;
+
+  // If we already have full-res cached and this is the center slot, go
+  // straight to full. Otherwise start on the thumbnail; upgrade later.
+  const startFull = cached && role === "center";
+  const showShimmer = role === "center" && !cached;
+  el.innerHTML = `
+    <a href="${fullUrl}" target="_blank" rel="noopener">
+      <img src="${startFull ? fullUrl : thumbUrl}"
+           data-target="${fullUrl}"
+           loading="lazy"
+           alt="${escAttr(hit.addr ?? "")}">
+      ${showShimmer ? `<div class="shimmer"></div>` : ""}
+    </a>
+  `;
+  // If the thumbnail itself 404s (rare but happens), swap straight to full-res.
+  const img = el.querySelector("img");
+  img.addEventListener("error", () => {
+    if (img.src !== fullUrl) img.src = fullUrl;
+  }, { once: true });
+  return el;
+}
+
+function upgradeToFullRes(sl, hit) {
+  const fullUrl = `${FULL_BASE}/${hit.io}`;
+  const img = sl.el.querySelector("img");
+  if (!img) return;
+
+  if (recentFullSet.has(fullUrl)) {
+    if (img.src !== fullUrl) img.src = fullUrl;
+    sl.hasFullRes = true;
+    markRecent(fullUrl);
+    return;
+  }
+
+  // Add shimmer if not already present, then preload full-res.
+  const a = sl.el.querySelector("a");
+  if (a && !sl.el.querySelector(".shimmer")) {
+    a.insertAdjacentHTML("beforeend", `<div class="shimmer"></div>`);
+  }
+  const pre = new Image();
+  pre.onload = () => {
+    if (img.dataset.target !== fullUrl) return;
+    img.src = fullUrl;
+    sl.hasFullRes = true;
+    const shim = sl.el.querySelector(".shimmer");
+    if (shim) { shim.classList.add("fade-out"); setTimeout(() => shim.remove(), 240); }
+    markRecent(fullUrl);
+  };
+  pre.onerror = () => {
+    const shim = sl.el.querySelector(".shimmer");
+    if (shim) shim.remove();
+  };
+  pre.src = fullUrl;
+}
+
+function clearAllSlides() {
+  for (const [io, sl] of slideRegistry) {
+    sl.el.classList.remove("slot-left", "slot-center", "slot-right");
+    sl.el.classList.add("slot-exit");
+    const { el } = sl;
+    setTimeout(() => el.remove(), 400);
+  }
+  slideRegistry.clear();
+}
+
+function updateBottomCard(hit) {
   if (hit.bbl !== lastBbl) {
     currentIoIdx = 0;
     lastBbl = hit.bbl;
   }
   const extra = alts[hit.bbl] ?? [];
   const ids = [stripIo(hit.io), ...extra];
-  const currentId = ids[currentIoIdx] ?? ids[0];
-  const io = `IO_${currentId}`;
 
-  // Photo strategy: render thumbnail immediately with a shimmer overlay,
-  // preload full-res in the background, then swap src + fade shimmer out.
-  // If we've loaded this full-res recently, the HTTP cache serves it
-  // instantly — skip the thumbnail step.
-  const thumbUrl = `${THUMB_BASE}/${io}?fallback-thumbnail=1`;
-  const fullUrl  = `${FULL_BASE}/${io}`;
-  const cached   = recentFullSet.has(fullUrl);
-
-  photoWrap.classList.remove("empty");
-  photoWrap.innerHTML = `
-    <a href="${fullUrl}" target="_blank" rel="noopener">
-      <img src="${cached ? fullUrl : thumbUrl}"
-           data-target="${fullUrl}"
-           alt="${escAttr(hit.addr ?? "")}">
-      ${cached ? "" : `<div class="shimmer"></div>`}
-    </a>
-  `;
-
-  if (!cached) {
-    const pre = new Image();
-    pre.onload = () => {
-      const img = photoWrap.querySelector("img");
-      if (!img || img.dataset.target !== fullUrl) return;
-      img.src = fullUrl;
-      const shim = photoWrap.querySelector(".shimmer");
-      if (shim) {
-        shim.classList.add("fade-out");
-        setTimeout(() => shim.remove(), 240);
-      }
-      markRecent(fullUrl);
-    };
-    pre.onerror = () => {
-      const shim = photoWrap.querySelector(".shimmer");
-      if (shim) shim.remove();
-    };
-    pre.src = fullUrl;
-  } else {
-    markRecent(fullUrl);
-  }
-
-  // Bottom card: address + distance; optional alts.
   bottomCard.hidden = false;
   addrText.textContent = hit.addr ?? "Unknown address";
   subText.innerHTML = `${hit.distance.toFixed(0)} m away${manualOverride ? manualChipHtml() : ""}`;
@@ -280,7 +421,7 @@ function renderTarget(hit) {
 
   if (ids.length > 1) {
     altsHintEl.hidden = false;
-    altsHintEl.textContent = `${ids.length} angles of this building — tap or swipe`;
+    altsHintEl.textContent = `${ids.length} angles of this building — tap below`;
     altsStrip.innerHTML = ids.map((id, i) => `
       <a href="#" class="${i === currentIoIdx ? "current" : ""}" data-i="${i}">
         <img src="${THUMB_BASE}/IO_${id}?fallback-thumbnail=1" alt="">
@@ -290,14 +431,39 @@ function renderTarget(hit) {
       a.addEventListener("click", (ev) => {
         ev.preventDefault();
         currentIoIdx = Number(a.dataset.i);
-        renderTarget(hit);
+        swapCenterAlt(hit, ids[currentIoIdx]);
+        // Refresh the "current" indicator on the strip.
+        altsStrip.querySelectorAll("a").forEach((a, i) => {
+          a.classList.toggle("current", i === currentIoIdx);
+        });
       });
     });
-    attachSwipe(photoWrap, ids.length, hit);
   } else {
     altsHintEl.hidden = true;
     altsStrip.innerHTML = "";
   }
+}
+
+// Swap the center slide's image to a different angle (same BBL) without
+// disturbing the carousel. Used when the user taps an alternate thumbnail.
+function swapCenterAlt(hit, altId) {
+  const sl = slideRegistry.get(hit.io);
+  if (!sl) return;
+  const fullUrl  = `${FULL_BASE}/IO_${altId}`;
+  const thumbUrl = `${THUMB_BASE}/IO_${altId}?fallback-thumbnail=1`;
+  const img = sl.el.querySelector("img");
+  if (!img) return;
+  const cached = recentFullSet.has(fullUrl);
+  img.dataset.target = fullUrl;
+  img.src = cached ? fullUrl : thumbUrl;
+  if (cached) { markRecent(fullUrl); return; }
+  const pre = new Image();
+  pre.onload = () => {
+    if (img.dataset.target !== fullUrl) return;
+    img.src = fullUrl;
+    markRecent(fullUrl);
+  };
+  pre.src = fullUrl;
 }
 
 function manualChipHtml() {
@@ -312,31 +478,10 @@ function escAttr(s) {
   return String(s).replace(/"/g, "&quot;");
 }
 
-// Horizontal swipe on the photo cycles alternates.
-function attachSwipe(target, count, hit) {
-  if (!target || count <= 1) return;
-  if (target._swipeBound) return;
-  target._swipeBound = true;
-  let x0 = null, y0 = null;
-  target.addEventListener("touchstart", (e) => {
-    const t = e.touches[0];
-    x0 = t.clientX; y0 = t.clientY;
-  }, { passive: true });
-  target.addEventListener("touchend", (e) => {
-    if (x0 == null) return;
-    const t = e.changedTouches[0];
-    const dx = t.clientX - x0, dy = t.clientY - y0;
-    x0 = y0 = null;
-    if (Math.abs(dx) < 40 || Math.abs(dy) > 60) return;
-    currentIoIdx = (currentIoIdx + (dx < 0 ? 1 : -1) + count) % count;
-    renderTarget(hit);
-  }, { passive: true });
-}
-
 function stripIo(io) { return io.startsWith("IO_") ? io.slice(3) : io; }
 
 function renderNoCandidate(lat, lon, hdg) {
-  photoWrap.innerHTML = "";
+  clearAllSlides();
   photoWrap.classList.add("empty");
   lastBbl = null;
 
@@ -387,19 +532,13 @@ function compassHint(diff) {
 
 function onHeadingChange(h) {
   heading = h;
-  compass.classList.remove("idle");
-
-  // Compass SVG: rotate so the needle points to the user's facing direction
-  // (top of the screen = direction they're pointed).
-  compassSvg.style.transform = `rotate(${h}deg)`;
-
   // Map: rotate the tiles so the user's facing direction is UP. This is
-  // Google-Maps-style orientation.
+  // Google-Maps-style orientation. The N badge around the ring shows
+  // where true north is.
   if (mapReady) {
     map.setBearing(h);
     placeNorthLabel(h);
   }
-
   requestScan();
   persistState();
 }
@@ -430,8 +569,8 @@ function requestScan() {
 function runCandidateScan() {
   const pos = effectivePos();
   if (!pos || heading == null || !index) return;
-  const hit = pickTarget(pos.lat, pos.lon, heading);
-  if (hit) renderTarget(hit);
+  const trio = pickTrio(pos.lat, pos.lon, heading);
+  if (trio) renderTrio(trio);
   else renderNoCandidate(pos.lat, pos.lon, heading);
 }
 
@@ -468,6 +607,7 @@ function initMap() {
     mapReady = true;
     miniMap.hidden = false;
     placeNorthLabel(heading ?? 0);
+    brightenRoads();
   });
   // If the style fails (network blip), log and keep the rest of the app alive.
   map.on("error", (e) => console.warn("[minimap]", e?.error?.message || e));
@@ -522,11 +662,32 @@ function clearManualOverride() {
 // when heading=90 (east) N is to the left; heading=270 (west) N is right.
 function placeNorthLabel(h) {
   if (!miniMapNorth) return;
-  const r = 76; // radius in px from minimap center
+  const r = 58; // radius in px — sits on the ring of the 110 px minimap
   const b = h * Math.PI / 180;
   const x = -r * Math.sin(b);
   const y = -r * Math.cos(b);
   miniMapNorth.style.transform = `translate(${x}px, ${y}px)`;
+}
+
+// Post-load tweak: brighten the road lines in the OpenFreeMap dark style.
+// Default roads are a dim grey; we want them bright so the user can read
+// street-level detail at a glance on a tiny 110 px minimap. We match by
+// layer id heuristic (names like "highway_", "road_", "street_"), which
+// catches the OpenFreeMap schema without hard-coding a full layer list.
+function brightenRoads() {
+  if (!map) return;
+  const style = map.getStyle();
+  if (!style?.layers) return;
+  for (const layer of style.layers) {
+    if (layer.type !== "line") continue;
+    const id = (layer.id || "").toLowerCase();
+    // Match transportation-ish layers; skip borders/rail which also use lines.
+    if (!/(highway|road|street|path|motorway|trunk|primary|secondary|tertiary|residential|service|transportation)/.test(id)) continue;
+    try {
+      map.setPaintProperty(layer.id, "line-color", "#f2f2f2");
+      map.setPaintProperty(layer.id, "line-opacity", 1);
+    } catch { /* some layers don't accept paint updates — ignore */ }
+  }
 }
 
 // ---------- Permissions / sources ----------
