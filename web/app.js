@@ -40,7 +40,9 @@ const ANGLE_WEIGHT = 2.5; // ranking weight: 1° misalignment ≈ 2.5 m
 
 // Map tile style. OpenFreeMap is free, no API key, attribution baked in.
 const MAP_STYLE = "https://tiles.openfreemap.org/styles/dark";
-const MAP_ZOOM  = 17.5;
+// Zoom 16.5 shows ~2 blocks around the user — enough context to see which
+// street you're on and correct a bad GPS fix by tapping the right one.
+const MAP_ZOOM  = 16.5;
 
 // Candidate scan is throttled — no faster than once every SCAN_MIN_MS.
 // With 561k rows the scan takes ~15 ms on mobile, so 80 ms keeps us well
@@ -62,6 +64,13 @@ let manualOverride = null; // { lat, lon } or null — user-corrected position
 let heading = null;        // degrees 0-360, or null
 let hasCompass = false;
 let currentIoIdx = 0;      // which alternate of current BBL we're showing
+// Directional slide entry — the previous heading, and the direction the user
+// last turned ("left" or "right"). New center slides fly in from whichever
+// side the user is turning TOWARDS; outgoing center slides exit the other
+// side. This is what makes the carousel feel like panning across a row of
+// buildings rather than always entering from the right.
+let lastHeading = null;
+let lastTurnDir = "right";
 
 // MapLibre minimap.
 let map = null;
@@ -258,15 +267,24 @@ function rowToPhoto(row, c, extra = {}) {
 
 // ---------- Rendering (3-slide carousel) ----------
 //
-// slideRegistry maps io -> { el, hasFullRes } for every slide currently in
-// the DOM. On each scan we compute the desired trio (prev/current/next),
-// then reconcile:
-//   - Slides no longer in the trio get the .slot-exit class and are
-//     removed 400 ms later, after the CSS transition fades them out.
+// slideRegistry maps BBL -> { el, hasFullRes, role, io } for every slide
+// currently in the DOM. We key by BBL (not by IO) so that when the user
+// taps through alternates of the same building, or when GPS jitter flips
+// which angle of a building is "closest", the same persistent DOM node
+// survives — the image src swaps, but the slide doesn't get recreated and
+// re-fly-in.
+//
+// On each scan we compute the desired trio (prev/current/next), then
+// reconcile:
+//   - Slides no longer in the trio get a .slot-far-* class and are
+//     removed 400 ms later, after the CSS transition slides them offscreen.
+//     Direction = opposite of the user's turn direction (if you turn right,
+//     the stale slide exits to the LEFT of the viewport).
 //   - Desired slides that aren't in the registry are freshly appended.
-//     They START with .slot-far-left or .slot-far-right so the first
-//     frame paints them offscreen; a forced reflow, then the real role
-//     class, lets CSS animate them into position.
+//     They START with a .slot-far-* class on the side matching the turn
+//     direction (turn right → enter from right; turn left → enter from
+//     left). A forced reflow, then the real role class, lets CSS animate
+//     them into position.
 //   - Existing slides just get their role class swapped — CSS handles
 //     the transform/filter interpolation.
 //
@@ -275,47 +293,80 @@ function rowToPhoto(row, c, extra = {}) {
 // the transition fires on a class change rather than a node replacement.
 
 let lastBbl = null;
-const slideRegistry = new Map(); // io -> { el, hasFullRes }
+const slideRegistry = new Map(); // bbl -> { el, hasFullRes, role, io }
 
 function hideEmptyHint() { emptyHint.hidden = true; }
 function showEmptyHint(text) { emptyHint.textContent = text; emptyHint.hidden = false; }
+
+/**
+ * Pick the entry class for a NEW slide appearing in `role`.
+ * Prev/next slots always enter from their own side; center slides enter
+ * from the direction of the user's last turn.
+ */
+function entryClassFor(role, turnDir) {
+  if (role === "left")  return "slot-far-left";
+  if (role === "right") return "slot-far-right";
+  // role === "center" — enter from the turn direction.
+  return turnDir === "left" ? "slot-far-left" : "slot-far-right";
+}
+
+/**
+ * Pick the exit class for a slide LEAVING `oldRole`. Mirrors entryClassFor:
+ * a prev that's leaving the left side exits left; a stale center exits to
+ * the OPPOSITE side from the current turn (i.e. if the user is turning
+ * right, the old center slides off to the left).
+ */
+function exitClassFor(oldRole, turnDir) {
+  if (oldRole === "left")  return "slot-far-left";
+  if (oldRole === "right") return "slot-far-right";
+  return turnDir === "right" ? "slot-far-left" : "slot-far-right";
+}
 
 function renderTrio(trio) {
   hideEmptyHint();
   photoWrap.classList.remove("empty");
 
-  // Build desired state: io -> role.
+  // Build desired state: bbl -> { role, hit }.
   const desired = new Map();
-  if (trio.prev)    desired.set(trio.prev.io,    { role: "left",   hit: trio.prev });
-  if (trio.current) desired.set(trio.current.io, { role: "center", hit: trio.current });
-  if (trio.next)    desired.set(trio.next.io,    { role: "right",  hit: trio.next });
+  if (trio.prev)    desired.set(trio.prev.bbl,    { role: "left",   hit: trio.prev });
+  if (trio.current) desired.set(trio.current.bbl, { role: "center", hit: trio.current });
+  if (trio.next)    desired.set(trio.next.bbl,    { role: "right",  hit: trio.next });
 
-  // 1. Remove slides that are no longer desired — fade them out.
-  for (const [io, sl] of slideRegistry) {
-    if (desired.has(io)) continue;
-    sl.el.classList.remove("slot-left", "slot-center", "slot-right");
-    sl.el.classList.add("slot-exit");
+  // 1. Remove slides that are no longer desired — slide them off in the
+  //    direction opposite to the user's turn.
+  for (const [bbl, sl] of slideRegistry) {
+    if (desired.has(bbl)) continue;
+    const exit = exitClassFor(sl.role, lastTurnDir);
+    sl.el.classList.remove("slot-left", "slot-center", "slot-right", "slot-far-left", "slot-far-right");
+    sl.el.classList.add(exit);
     const { el } = sl;
     setTimeout(() => el.remove(), 400);
-    slideRegistry.delete(io);
+    slideRegistry.delete(bbl);
   }
 
   // 2. Add or update desired slides.
-  for (const [io, { role, hit }] of desired) {
-    let sl = slideRegistry.get(io);
+  for (const [bbl, { role, hit }] of desired) {
+    let sl = slideRegistry.get(bbl);
     if (!sl) {
       const el = createSlideEl(hit, role);
-      // Enter from offscreen, then animate into role position.
-      const entry = role === "left" ? "slot-far-left" : "slot-far-right";
+      // Enter from offscreen in the direction the user is turning toward.
+      const entry = entryClassFor(role, lastTurnDir);
       el.classList.add(entry);
       photoWrap.appendChild(el);
       // Force layout so the browser registers the "far" position before
       // the transition to the real role class fires.
       void el.offsetWidth;
       el.classList.remove(entry);
-      sl = { el, hasFullRes: false };
-      slideRegistry.set(io, sl);
+      sl = { el, hasFullRes: false, role, io: hit.io };
+      slideRegistry.set(bbl, sl);
+    } else if (sl.io !== hit.io) {
+      // Same building, different angle (alt). Swap image in place — no
+      // entry animation, since the DOM node is surviving the transition.
+      swapSlideImage(sl, hit);
+      sl.io = hit.io;
+      sl.hasFullRes = false;
     }
+    sl.role = role;
     // Assign/swap role class — CSS transition animates the move.
     sl.el.classList.remove("slot-left", "slot-center", "slot-right", "slot-far-left", "slot-far-right", "slot-exit");
     sl.el.classList.add(`slot-${role}`);
@@ -330,6 +381,23 @@ function renderTrio(trio) {
 
   // 3. Bottom card follows the center slide.
   if (trio.current) updateBottomCard(trio.current);
+}
+
+/**
+ * Swap the image src on an existing slide to a different IO (same BBL,
+ * different angle). Used when pickTrio picks a different alt as "closest"
+ * for a BBL that was already on screen — we want the node to persist so
+ * it doesn't re-animate in.
+ */
+function swapSlideImage(sl, hit) {
+  const img = sl.el.querySelector("img");
+  if (!img) return;
+  const fullUrl  = `${FULL_BASE}/${hit.io}`;
+  const thumbUrl = `${THUMB_BASE}/${hit.io}?fallback-thumbnail=1`;
+  const cached = recentFullSet.has(fullUrl);
+  img.dataset.target = fullUrl;
+  img.src = cached ? fullUrl : thumbUrl;
+  if (cached) markRecent(fullUrl);
 }
 
 function createSlideEl(hit, role) {
@@ -397,8 +465,8 @@ function upgradeToFullRes(sl, hit) {
 }
 
 function clearAllSlides() {
-  for (const [io, sl] of slideRegistry) {
-    sl.el.classList.remove("slot-left", "slot-center", "slot-right");
+  for (const [, sl] of slideRegistry) {
+    sl.el.classList.remove("slot-left", "slot-center", "slot-right", "slot-far-left", "slot-far-right");
     sl.el.classList.add("slot-exit");
     const { el } = sl;
     setTimeout(() => el.remove(), 400);
@@ -446,21 +514,27 @@ function updateBottomCard(hit) {
 
 // Swap the center slide's image to a different angle (same BBL) without
 // disturbing the carousel. Used when the user taps an alternate thumbnail.
+// Registry is keyed by BBL, so the center's DOM node is looked up by the
+// hit's bbl rather than its IO — the IO is just what we're swapping TO.
 function swapCenterAlt(hit, altId) {
-  const sl = slideRegistry.get(hit.io);
+  const sl = slideRegistry.get(hit.bbl);
   if (!sl) return;
-  const fullUrl  = `${FULL_BASE}/IO_${altId}`;
-  const thumbUrl = `${THUMB_BASE}/IO_${altId}?fallback-thumbnail=1`;
+  const newIo   = `IO_${altId}`;
+  const fullUrl  = `${FULL_BASE}/${newIo}`;
+  const thumbUrl = `${THUMB_BASE}/${newIo}?fallback-thumbnail=1`;
   const img = sl.el.querySelector("img");
   if (!img) return;
   const cached = recentFullSet.has(fullUrl);
   img.dataset.target = fullUrl;
   img.src = cached ? fullUrl : thumbUrl;
+  sl.io = newIo;
+  sl.hasFullRes = cached;
   if (cached) { markRecent(fullUrl); return; }
   const pre = new Image();
   pre.onload = () => {
     if (img.dataset.target !== fullUrl) return;
     img.src = fullUrl;
+    sl.hasFullRes = true;
     markRecent(fullUrl);
   };
   pre.src = fullUrl;
@@ -531,6 +605,18 @@ function compassHint(diff) {
 // and made the compass feel delayed.
 
 function onHeadingChange(h) {
+  // Track turn direction from signed heading delta. Small deltas (<0.3°) are
+  // gyro noise — ignore them so the turn direction doesn't flap on every
+  // micro-jitter. Positive delta = turning right (clockwise, bearing grows);
+  // negative = turning left.
+  if (lastHeading != null) {
+    const delta = angleDiff(h, lastHeading);
+    if (Math.abs(delta) > 0.3) {
+      lastTurnDir = delta > 0 ? "right" : "left";
+    }
+  }
+  lastHeading = h;
+
   heading = h;
   // Map: rotate the tiles so the user's facing direction is UP. This is
   // Google-Maps-style orientation. The N badge around the ring shows
@@ -607,7 +693,7 @@ function initMap() {
     mapReady = true;
     miniMap.hidden = false;
     placeNorthLabel(heading ?? 0);
-    brightenRoads();
+    cleanupMapStyle();
   });
   // If the style fails (network blip), log and keep the rest of the app alive.
   map.on("error", (e) => console.warn("[minimap]", e?.error?.message || e));
@@ -669,24 +755,30 @@ function placeNorthLabel(h) {
   miniMapNorth.style.transform = `translate(${x}px, ${y}px)`;
 }
 
-// Post-load tweak: brighten the road lines in the OpenFreeMap dark style.
-// Default roads are a dim grey; we want them bright so the user can read
-// street-level detail at a glance on a tiny 110 px minimap. We match by
-// layer id heuristic (names like "highway_", "road_", "street_"), which
-// catches the OpenFreeMap schema without hard-coding a full layer list.
-function brightenRoads() {
+// Post-load tweak: (a) brighten road fills to clean white so street-level
+// detail is readable on a 110 px porthole, and (b) hide the dark "casing"
+// layers (the outline lines that flank every road) because once the fill
+// is white, the casings read as distracting dotted white lines on either
+// side of every street. Matched by layer-id heuristic — OpenFreeMap uses
+// names like `highway_primary`, `highway_primary_casing`, etc.
+function cleanupMapStyle() {
   if (!map) return;
   const style = map.getStyle();
   if (!style?.layers) return;
   for (const layer of style.layers) {
     if (layer.type !== "line") continue;
     const id = (layer.id || "").toLowerCase();
-    // Match transportation-ish layers; skip borders/rail which also use lines.
-    if (!/(highway|road|street|path|motorway|trunk|primary|secondary|tertiary|residential|service|transportation)/.test(id)) continue;
+    const isRoadish = /(highway|road|street|path|motorway|trunk|primary|secondary|tertiary|residential|service|transportation)/.test(id);
+    if (!isRoadish) continue;
+    const isCasing = /(casing|outline|bridge_casing|tunnel_casing)/.test(id);
     try {
-      map.setPaintProperty(layer.id, "line-color", "#f2f2f2");
-      map.setPaintProperty(layer.id, "line-opacity", 1);
-    } catch { /* some layers don't accept paint updates — ignore */ }
+      if (isCasing) {
+        map.setLayoutProperty(layer.id, "visibility", "none");
+      } else {
+        map.setPaintProperty(layer.id, "line-color", "#f2f2f2");
+        map.setPaintProperty(layer.id, "line-opacity", 1);
+      }
+    } catch { /* some layers don't accept updates — ignore */ }
   }
 }
 

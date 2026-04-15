@@ -359,22 +359,24 @@
       box-shadow: 0 0 5px rgba(0,0,0,0.55);
       z-index: 3;
     }
+    /* Reset-to-GPS pin. Just the white icon — no background, no ring —
+       so it reads as a bare map pin rather than a UI chip. */
     .miniMap-reset {
       position: absolute;
       top: 2px; left: 2px;
-      width: 22px; height: 22px;
-      border-radius: 50%;
-      background: rgba(0,0,0,0.72);
-      border: 1px solid rgba(255,255,255,0.35);
-      color: #fff;
-      font-size: 0.72rem;
-      line-height: 1;
-      cursor: pointer;
-      display: flex; align-items: center; justify-content: center;
-      z-index: 4;
+      width: 18px; height: 24px;
+      background: none;
+      border: none;
       padding: 0;
+      color: #fff;
+      cursor: pointer;
+      z-index: 4;
+      line-height: 0;
+      /* Shadow so the white pin stays legible even over bright map fills. */
+      filter: drop-shadow(0 1px 2px rgba(0,0,0,0.8));
     }
-    .miniMap-reset:hover { background: rgba(0,0,0,0.85); }
+    .miniMap-reset svg { width: 100%; height: 100%; display: block; }
+    .miniMap-reset:hover { filter: drop-shadow(0 1px 3px rgba(255,255,255,0.4)); }
 
     /* ---------- Contextual empty / loading text ----------
        Shown when the photo pane is empty — "Getting location…", "Point
@@ -426,7 +428,12 @@
     <div class="miniMap-cone"></div>
     <div class="miniMap-dot"></div>
     <div class="miniMap-north" id="miniMapNorth">N</div>
-    <button id="miniMapReset" class="miniMap-reset" hidden title="Reset to GPS location" aria-label="Reset to GPS">⌖</button>
+    <button id="miniMapReset" class="miniMap-reset" hidden title="Reset to GPS location" aria-label="Reset to GPS">
+      <!-- Bare white map-pin (teardrop). No background/circle — CSS colors it via currentColor. -->
+      <svg viewBox="0 0 20 28" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <path fill="currentColor" d="M10 0.5 C5 0.5 1 4.4 1 9.3 C1 15.8 10 27.5 10 27.5 C10 27.5 19 15.8 19 9.3 C19 4.4 15 0.5 10 0.5 Z M10 12.8 C8 12.8 6.4 11.1 6.4 9.1 C6.4 7.1 8 5.5 10 5.5 C12 5.5 13.6 7.1 13.6 9.1 C13.6 11.1 12 12.8 10 12.8 Z"/>
+      </svg>
+    </button>
   </div>
 
   <!-- Top pill: title only (compass moved to minimap). -->
@@ -454,6 +461,7 @@
     </div>
     <div class="infoPanel" id="infoPanel" hidden>
       <p>Photos courtesy of the <b>NYC Municipal Archives</b>, 1940s Tax Photographs collection. Placed on the map using NYC MapPLUTO.</p>
+      <p style="margin-top: 8px;">If your location looks wrong, <b>tap the correct spot on the minimap</b> to adjust it — phone GPS can be off by 20–40 m in dense streets.</p>
     </div>
   </div>
 
