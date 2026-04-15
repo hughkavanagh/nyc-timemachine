@@ -41,6 +41,12 @@ const FULL_BASE  = "https://nycrecords.access.preservica.com/download/file";
 // ones — geometrically backwards.
 const CORRIDOR_HALFWIDTH_M          = 10;  // primary: first building in line-of-sight
 const CORRIDOR_FALLBACK_HALFWIDTH_M = 22;  // "neighbor's neighbor" wider strip
+// Last-resort angle cone. SoHo parcels are ~30 m deep, so a centroid can
+// sit 20-25 m off the street centerline; combined with a few degrees of
+// compass jitter, perfectly-aimed shots can fall outside the 22 m perp
+// corridor. The same-street filter prevents parallel-street bleed, so a
+// generous final cone is safe: "anything ahead within ±45° on your street".
+const ANGLE_FALLBACK_DEG            = 45;
 const MAX_DIST_M                    = 120; // max forward distance for trio selection
 const NEIGHBOR_DIST_M               = 200; // outer radius: everything we might consider
 
@@ -344,6 +350,21 @@ function pickScene(lat, lon, hdg) {
   // Fallback: widen corridor (catches the next-door neighbor when the
   // exact building you're aimed at isn't in our index).
   if (bestIdx < 0) bestIdx = pickInCorridor(CORRIDOR_FALLBACK_HALFWIDTH_M, MAX_DIST_M * 1.25);
+  // Widest fallback: pure angle cone. SoHo-style deep parcels whose
+  // centroids sit 20-25 m behind the street frontage can fall outside
+  // even the 22 m corridor; this step picks the nearest-forward same-
+  // street building within ±45° of the heading. Safe because the
+  // same-street filter above has already removed parallel-street
+  // parcels, so we can't accidentally pick Broadway from mid-Mercer.
+  if (bestIdx < 0) {
+    let bestFwd = Infinity;
+    for (let i = 0; i < forward.length; i++) {
+      const x = forward[i];
+      if (Math.abs(x.ang) > ANGLE_FALLBACK_DEG) continue;
+      if (x.fwd > MAX_DIST_M * 1.25) continue;
+      if (x.fwd < bestFwd) { bestFwd = x.fwd; bestIdx = i; }
+    }
+  }
 
   const makeHit = (i) => i >= 0 && i < forward.length
     ? rowToPhoto(forward[i].row, c, {
