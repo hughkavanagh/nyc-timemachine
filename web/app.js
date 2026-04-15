@@ -190,12 +190,18 @@ function colIdx() {
 // anchor for determining "what street am I on". If the closest building is
 // further than this, we're probably in a park or plaza; skip the filter.
 const USER_STREET_ANCHOR_MAX_M = 50;
-// Extension (m) past the closest building's distance in which other streets
-// are allowed to count as "the user's street". 12 m is tighter than the
-// distance from one side of an SoHo street to the other (~20 m) — so
-// standing mid-Mercer can't vote for Broadway, but actual corner positions
-// where two adjacent parcels face different streets still register both.
-const USER_STREET_EXTEND_M  = 12;
+// Radius (m) for corner detection. Any building within this distance of the
+// user votes for "the user's street set". Tuned so that:
+//   - mid-Mercer: only Mercer buildings fall within 20 m (Broadway/Greene
+//     parcel centroids across the block are ≥ 40 m), so the user is locked
+//     to Mercer and parallel-street bleed is blocked.
+//   - standing at (or near) an intersection: the 4 corner buildings sit
+//     within ~15-20 m of the user, so BOTH streets vote and we don't
+//     wrongly filter out the one the user is facing.
+// This replaced the old "closest + 12 m extend" scheme which missed
+// corners whenever the two nearest buildings on different streets happened
+// to be > 12 m apart (which they usually are).
+const USER_STREET_CORNER_RADIUS_M = 20;
 
 /**
  * Extract a street name from a MapPLUTO-style address like "123 PRINCE ST"
@@ -236,12 +242,22 @@ function extractStreet(addr) {
  * `distance + k*angle`: a near-miss from 10 m away won't get outranked by
  * a perfectly-aligned building 80 m down the block.
  *
- * Cascade:
- *   1. Tight corridor (perp ≤ 10 m): sweet spot.
- *   2. Widened corridor (perp ≤ 22 m): catches a next-door neighbor if the
- *      exact building you're pointing at isn't in our photo index.
- *   3. Peek mode: no hit even in the wide corridor. Surface the nearest
- *      same-street photo on each side so the user knows to turn.
+ * Cascade (each step falls through to the next only if it yields nothing):
+ *   1. Tight corridor (perp ≤ 10 m): sweet spot — ray literally passes
+ *      within 10 m of the parcel centroid.
+ *   2. Widened corridor (perp ≤ 22 m): catches a next-door neighbor if
+ *      the exact building you're pointing at isn't in our photo index.
+ *   3. Angle cone (|ang| ≤ 45°): catches deep-lot cases where the
+ *      parcel centroid is 20-25 m behind the street frontage and thus
+ *      outside the 22 m corridor even with perfect aim.
+ *   4. pointingAnchor promotion (|ang| ≤ 75°): whatever same-street
+ *      forward photo is CLOSEST along the ray. This is a safety net —
+ *      if a same-street photo exists ahead of the user at all, they
+ *      see it, even if the alignment is imperfect. The point is to
+ *      never claim "no photo here" when a photo for a building ahead
+ *      on the user's street is sitting right there in our index.
+ *   5. Peek mode: no same-street photo within 75° forward. Surface
+ *      the nearest ones on each side so the user knows to turn.
  *
  * Same-street filter is applied up front — if the user is mid-block on
  * Prince St, Broadway candidates at the end of the block are excluded
@@ -261,28 +277,26 @@ function pickScene(lat, lon, hdg) {
   }
   if (!cands.length) return null;
 
-  // Anchor the "user's street" on the SINGLE closest building. Earlier we
-  // tallied hits within 35 m — but at 35 m mid-Mercer catches Broadway
-  // parcels across the block and ties let them through. Anchoring on the
-  // closest building + extending only ~12 m past that distance removes
-  // that failure mode. A true corner still works: the 4 corner buildings
-  // (two on each street) all sit within 10-20 m of each other.
+  // Anchor the "user's street" via a radius sweep. Every building within
+  // USER_STREET_CORNER_RADIUS_M (20 m) of the user votes for its street
+  // name. Mid-block that's a single street; at an intersection all ~4
+  // corner buildings fall inside and both streets vote, so we don't drop
+  // the one the user is actually facing.
   const sortedByDist = cands.slice().sort((a, b) => a.d - b.d);
   let userStreetSet = null;
   if (sortedByDist[0].d <= USER_STREET_ANCHOR_MAX_M) {
-    const d0 = sortedByDist[0].d;
-    const base = extractStreet(sortedByDist[0].row[c.addr]);
     const streets = new Set();
-    if (base) streets.add(base);
-    // Include streets represented by any building within d0 + 12 m. In
-    // practice that's "same block face" mid-block, or "two adjacent corner
-    // lots" at an intersection.
-    const cutoff = d0 + USER_STREET_EXTEND_M;
-    for (let i = 1; i < sortedByDist.length; i++) {
-      if (sortedByDist[i].d > cutoff) break;
-      const s = extractStreet(sortedByDist[i].row[c.addr]);
+    for (const x of sortedByDist) {
+      if (x.d > USER_STREET_CORNER_RADIUS_M) break;
+      const s = extractStreet(x.row[c.addr]);
       if (s) streets.add(s);
-      if (streets.size >= 2) break; // NYC corners are 2 streets, not more
+    }
+    // If *no* building landed inside the radius (the anchor itself is
+    // between 20 and 50 m — sparse block, big plaza) fall back to the
+    // anchor's single street so we still get some filtering.
+    if (streets.size === 0) {
+      const s = extractStreet(sortedByDist[0].row[c.addr]);
+      if (s) streets.add(s);
     }
     if (streets.size > 0) userStreetSet = streets;
   }
@@ -364,6 +378,16 @@ function pickScene(lat, lon, hdg) {
       if (x.fwd > MAX_DIST_M * 1.25) continue;
       if (x.fwd < bestFwd) { bestFwd = x.fwd; bestIdx = i; }
     }
+  }
+  // Final fallback: if we have a pointingAnchor (= nearest-forward same-
+  // street building, no corridor/cone constraint), promote it to current
+  // as long as it's roughly ahead (≤ 75°). This guarantees that whenever
+  // a same-street photo exists forward of the user, they see it — even
+  // if deep-lot centroid geometry or heading jitter put it far off-ray.
+  // Saying "No 1940s photo here" while that exact photo is in our index
+  // and listed as the pointing target is the bug this closes.
+  if (bestIdx < 0 && anchorCand && Math.abs(anchorCand.ang) <= 75) {
+    bestIdx = forward.indexOf(anchorCand);
   }
 
   const makeHit = (i) => i >= 0 && i < forward.length
@@ -713,7 +737,13 @@ function updateBottomCard(hit, opts = {}) {
   addrText.textContent = hit.addr ?? "Unknown address";
 
   if (noPhotoHere) {
-    subText.innerHTML = `No 1940s photo here${manualOverride ? manualChipHtml() : ""}`;
+    // We reach this path only when pickScene's fallback cascade ran out —
+    // i.e. the nearest same-street forward photo is > 75° off the user's
+    // heading. The photo itself DOES exist in our index (pointingAnchor
+    // came from it); we just can't responsibly claim it's what the phone
+    // is pointing at. So the sub-text says "not in this direction"
+    // rather than "doesn't exist" — the latter would be a lie.
+    subText.innerHTML = `Nearest 1940s photo · turn to see${manualOverride ? manualChipHtml() : ""}`;
     wireManualChipReset();
     altsHintEl.hidden = true;
     altsStrip.innerHTML = "";
