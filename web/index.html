@@ -4,6 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>1940s Lens</title>
+  <!-- MapLibre GL JS for the rotating minimap. Loaded from unpkg CDN; no
+       API key needed. Paired with OpenFreeMap's free dark tile style. -->
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
   <style>
     :root {
       --bg: #000;
@@ -76,7 +79,8 @@
     #rotateHint p { margin: 0; font-size: 1rem; }
     @media (max-height: 480px) and (orientation: landscape) {
       #rotateHint { display: flex; }
-      #topPill, #bottomCard, #centerBtn, #photoWrap, #desktopCtrl { visibility: hidden; }
+      #topPill, #bottomCard, #centerBtn, #photoWrap, #desktopCtrl,
+      #miniMap, #emptyHint { visibility: hidden; }
     }
 
     /* ---------- Shared bubble style ---------- */
@@ -224,11 +228,153 @@
     @media (max-width: 420px) {
       #bottomCard, #desktopCtrl { left: 16px; right: 16px; }
     }
+
+    /* ---------- Minimap (circular, rotates with heading) ----------
+       Sits top-right under the safe area. The map tiles inside rotate
+       so the user's facing direction is always UP. The "N" badge on
+       the ring moves to whatever angle true north is from the user's
+       facing direction — same convention as Google Maps.
+       Tap anywhere on it to manually override GPS (see app.js). */
+    #miniMap {
+      position: fixed;
+      top: calc(env(safe-area-inset-top, 0) + 72px);
+      right: 14px;
+      width: 140px; height: 140px;
+      z-index: 15;
+    }
+    #miniMapGl {
+      position: absolute; inset: 0;
+      border-radius: 50%;
+      overflow: hidden;
+      box-shadow: 0 6px 18px rgba(0,0,0,0.55);
+      /* Soft vignette — the map fades out toward the edge so it feels
+         like a porthole rather than a hard-edged disc. `closest-side` is
+         important here: the default `farthest-corner` puts the gradient's
+         100% outside the container, so only a tiny sliver of fade would
+         actually be visible. */
+      -webkit-mask-image: radial-gradient(circle closest-side, #000 55%, rgba(0,0,0,0.5) 85%, transparent 100%);
+              mask-image: radial-gradient(circle closest-side, #000 55%, rgba(0,0,0,0.5) 85%, transparent 100%);
+      cursor: pointer;
+    }
+    #miniMapGl canvas { border-radius: 50%; }
+    /* MapLibre draws its own attribution/logos; we don't want them on a
+       70px-wide porthole. Hide via CSS; credit stays in the about panel. */
+    #miniMapGl .maplibregl-ctrl-attrib,
+    #miniMapGl .maplibregl-ctrl-logo { display: none !important; }
+
+    .miniMap-dot {
+      position: absolute;
+      top: 50%; left: 50%;
+      width: 12px; height: 12px;
+      margin: -6px 0 0 -6px;
+      border-radius: 50%;
+      background: #4a9fff;
+      box-shadow: 0 0 0 2px rgba(255,255,255,0.95), 0 0 10px rgba(74,159,255,0.5);
+      pointer-events: none;
+      z-index: 3;
+    }
+    .miniMap-cone {
+      position: absolute;
+      top: 50%; left: 50%;
+      width: 0; height: 0;
+      margin-left: -9px;
+      margin-top: -22px;
+      border-left: 9px solid transparent;
+      border-right: 9px solid transparent;
+      border-bottom: 11px solid rgba(74,159,255,0.9);
+      pointer-events: none;
+      z-index: 2;
+      filter: drop-shadow(0 0 3px rgba(74,159,255,0.4));
+    }
+    .miniMap-north {
+      position: absolute;
+      top: 50%; left: 50%;
+      width: 20px; height: 20px;
+      margin: -10px 0 0 -10px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.95);
+      color: #000;
+      font: 700 0.68rem/1 -apple-system, system-ui, sans-serif;
+      letter-spacing: 0.3px;
+      display: flex; align-items: center; justify-content: center;
+      /* The transform is set in JS each heading update (see placeNorthLabel).
+         Short transition smooths compass jitter slightly without hurting
+         felt reactivity. */
+      transition: transform 80ms linear;
+      will-change: transform;
+      pointer-events: none;
+      box-shadow: 0 0 6px rgba(0,0,0,0.55);
+      z-index: 3;
+    }
+    .miniMap-reset {
+      position: absolute;
+      top: 2px; left: 2px;
+      width: 26px; height: 26px;
+      border-radius: 50%;
+      background: rgba(0,0,0,0.72);
+      border: 1px solid rgba(255,255,255,0.35);
+      color: #fff;
+      font-size: 0.8rem;
+      line-height: 1;
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      z-index: 4;
+      padding: 0;
+    }
+    .miniMap-reset:hover { background: rgba(0,0,0,0.85); }
+
+    /* ---------- Contextual empty / loading text ----------
+       Shown when the photo pane is empty — "Getting location…", "Point
+       your phone at a building", "No 1940s photo in this direction".
+       Hidden when a photo is visible. */
+    #emptyHint {
+      position: fixed;
+      top: 45%; left: 50%;
+      transform: translate(-50%, -50%);
+      color: rgba(255,255,255,0.8);
+      font-size: 0.95rem;
+      text-align: center;
+      padding: 12px 20px;
+      max-width: 82%;
+      line-height: 1.4;
+      pointer-events: none;
+      z-index: 10;
+      white-space: pre-line;
+      text-shadow: 0 1px 10px rgba(0,0,0,0.9);
+    }
+
+    /* Tiny "manual location" chip shown in the bottom card when the user
+       has tapped the minimap to correct their position. */
+    .manualChip {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-size: 0.68rem; color: #fff;
+      background: rgba(74,159,255,0.35);
+      border: 1px solid rgba(74,159,255,0.7);
+      padding: 2px 8px;
+      border-radius: 999px;
+      margin-left: 6px;
+      cursor: pointer;
+      vertical-align: middle;
+    }
   </style>
 </head>
 <body>
   <!-- Full-width photo (or empty black when no candidate) -->
   <div id="photoWrap" class="empty"></div>
+
+  <!-- Contextual text shown when the photo pane is empty (loading,
+       no candidate, outside NYC, etc.). Hidden when a photo is up. -->
+  <div id="emptyHint" hidden></div>
+
+  <!-- Rotating circular minimap. Hidden until we have a first GPS fix
+       AND MapLibre finishes loading. -->
+  <div id="miniMap" hidden>
+    <div id="miniMapGl"></div>
+    <div class="miniMap-cone"></div>
+    <div class="miniMap-dot"></div>
+    <div class="miniMap-north" id="miniMapNorth">N</div>
+    <button id="miniMapReset" class="miniMap-reset" hidden title="Reset to GPS location" aria-label="Reset to GPS">⌖</button>
+  </div>
 
   <!-- Top pill: title + compass -->
   <div id="topPill" class="bubble">
@@ -286,6 +432,10 @@
     <p>Please rotate your phone to portrait</p>
   </div>
 
+  <!-- MapLibre GL: loaded BEFORE app.js so it's globally available as
+       `maplibregl` when the module runs. `defer` would also work but this
+       app is small enough that a synchronous load is fine. -->
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
   <script type="module" src="./app.js"></script>
 </body>
 </html>
