@@ -32,18 +32,23 @@ const ALTS_URL   = "/data/export/alternates.json";
 const THUMB_BASE = "https://nycrecords.access.preservica.com/download/thumbnail";
 const FULL_BASE  = "https://nycrecords.access.preservica.com/download/file";
 
-const CONE_DEG   = 22;    // half-angle considered "pointed at"
-const MAX_DIST_M = 120;   // max range for candidate buildings (dense NYC)
-const NEIGHBOR_DIST_M = 160; // wider range for the prev/next peeks
-const NEIGHBOR_ANG_DEG = 90; // prev/next must lie within ±90° of heading
-const ANGLE_WEIGHT = 2.5; // ranking weight: 1° misalignment ≈ 2.5 m
+// Candidate selection uses a corridor, not a cone. The corridor is a strip
+// running along the user's heading ray, with a half-width measured
+// perpendicular to the heading (in meters). This matches physical intuition:
+// a building is "pointed at" if your line-of-sight passes within a few
+// meters of it, regardless of distance. The old cone approach over-rejected
+// close, slightly-off-axis buildings and accepted distant nearly-aligned
+// ones — geometrically backwards.
+const CORRIDOR_HALFWIDTH_M          = 10;  // primary: first building in line-of-sight
+const CORRIDOR_FALLBACK_HALFWIDTH_M = 22;  // "neighbor's neighbor" wider strip
+const MAX_DIST_M                    = 120; // max forward distance for trio selection
+const NEIGHBOR_DIST_M               = 200; // outer radius: everything we might consider
 
 // Map tile style. OpenFreeMap is free, no API key, attribution baked in.
 const MAP_STYLE = "https://tiles.openfreemap.org/styles/dark";
-// Zoom 15.8 shows ~4 surrounding blocks on the 110 px porthole — enough
-// context to see which street you're on (with labels) and correct a bad
-// GPS fix by tapping the right one.
-const MAP_ZOOM  = 15.8;
+// Zoom 15.2 shows ~6 surrounding blocks on the 110 px porthole — enough
+// context to see your cross-streets and swipe the pin cleanly.
+const MAP_ZOOM  = 15.2;
 
 // Candidate scan is throttled — no faster than once every SCAN_MIN_MS.
 // With 561k rows the scan takes ~15 ms on mobile, so 80 ms keeps us well
@@ -76,6 +81,10 @@ let lastTurnDir = "right";
 // MapLibre minimap.
 let map = null;
 let mapReady = false;
+// True while the user is mid-drag on the minimap. Suppresses GPS-driven
+// recentering so their finger doesn't get yanked off the location they're
+// sliding the pin toward.
+let isDraggingMinimap = false;
 
 // Throttle state for candidate scan.
 let scanPending = false;
@@ -194,24 +203,41 @@ function extractStreet(addr) {
 }
 
 /**
- * Pick up to three adjacent-by-bearing candidates around the user's heading:
- *   - current: best-scored candidate within the view cone
- *   - prev:    the building at the next-lower bearing (peek on the left)
- *   - next:    the building at the next-higher bearing (peek on the right)
+ * Decide what to show. Returns one of:
+ *   { mode: "trio", prev, current, next }
+ *     — The sweet case. `current` is a building in the user's line-of-sight
+ *       corridor. `prev`/`next` are its ang-adjacent neighbors for the
+ *       carousel peeks.
+ *   { mode: "peek", peekLeft, peekRight }
+ *     — No building lies in a plausible corridor, but photos DO exist to
+ *       the user's left and/or right. The UI shows 10-15% slivers of those
+ *       images at the screen edges so the user knows which way to turn.
+ *   null
+ *     — Nothing within NEIGHBOR_DIST_M after street-filtering.
  *
- * Returns null if nothing lies in the view cone. Previous/next can be null
- * individually if there's nothing on that side.
+ * The ranking within "trio" mode uses a CORRIDOR, not a cone:
+ *   perp (m) = d * sin(ang_deg)   -- perpendicular from heading ray
+ *   fwd  (m) = d * cos(ang_deg)   -- forward distance along heading ray
  *
- * Deduped by BBL so two photos of the same building (alts) don't eat the
- * prev/next slots — alts still live inside the bottom-card strip.
+ * A building is "in the corridor" if |perp| < halfwidth and fwd > 0. Among
+ * those we pick the CLOSEST forward building — i.e. the first one your
+ * eye meets along the ray. This is far more accurate than
+ * `distance + k*angle`: a near-miss from 10 m away won't get outranked by
+ * a perfectly-aligned building 80 m down the block.
  *
- * Same-street filter: we also infer which street the user is standing on
- * (the most common street among buildings within USER_STREET_RADIUS_M) and
- * restrict candidates to buildings on that street. At corners, the nearby
- * set spans two streets and both are kept — so cross-street photos still
- * appear when you actually are at the intersection.
+ * Cascade:
+ *   1. Tight corridor (perp ≤ 10 m): sweet spot.
+ *   2. Widened corridor (perp ≤ 22 m): catches a next-door neighbor if the
+ *      exact building you're pointing at isn't in our photo index.
+ *   3. Peek mode: no hit even in the wide corridor. Surface the nearest
+ *      same-street photo on each side so the user knows to turn.
+ *
+ * Same-street filter is applied up front — if the user is mid-block on
+ * Prince St, Broadway candidates at the end of the block are excluded
+ * (unless the user is standing at the corner, in which case the nearby
+ * buildings vote for both streets and both sets are kept).
  */
-function pickTrio(lat, lon, hdg) {
+function pickScene(lat, lon, hdg) {
   const c = colIdx();
   // First pass: collect candidates AND tally which streets are within the
   // "user is on this street" radius. One loop; keeping both passes folded
@@ -266,38 +292,67 @@ function pickTrio(lat, lon, hdg) {
     if (!uniq.length) return null;
   }
 
-  // Signed angle from heading; keep only the forward half so buildings
-  // behind the user don't count as "prev/next".
-  for (const x of uniq) x.ang = angleDiff(x.b, hdg);
-  const window = uniq.filter(x => Math.abs(x.ang) <= NEIGHBOR_ANG_DEG);
-  window.sort((a, b) => a.ang - b.ang);
-  if (!window.length) return null;
-
-  // Pick current = best-scoring building within the view cone.
-  let bestIdx = -1, bestScore = Infinity;
-  for (let i = 0; i < window.length; i++) {
-    const x = window[i];
-    const absA = Math.abs(x.ang);
-    if (absA > CONE_DEG) continue;
-    if (x.d > MAX_DIST_M) continue;
-    const s = x.d + ANGLE_WEIGHT * absA;
-    if (s < bestScore) { bestScore = s; bestIdx = i; }
+  // Compute angle / perp / fwd for every candidate, and drop the back half.
+  for (const x of uniq) {
+    x.ang = angleDiff(x.b, hdg);
+    const angR = x.ang * D2R;
+    x.perp = x.d * Math.sin(angR); // signed: + right of ray, - left of ray
+    x.fwd  = x.d * Math.cos(angR); // signed: + ahead, - behind
   }
-  if (bestIdx < 0) return null; // nothing in cone
+  const forward = uniq.filter(x => x.fwd > 0);
+  // Sort by signed angle so prev/next ang-neighbors of the chosen "current"
+  // are just indices ±1 in this array.
+  forward.sort((a, b) => a.ang - b.ang);
+  if (!forward.length) return null;
 
-  const make = (i) => i >= 0 && i < window.length
-    ? rowToPhoto(window[i].row, c, {
-        distance: window[i].d,
-        offset: Math.abs(window[i].ang),
-        bearing: window[i].b,
+  // Corridor pick: closest forward building within a perpendicular half-width.
+  const pickInCorridor = (perpHalfwidth, maxFwd) => {
+    let bestIdx = -1, bestFwd = Infinity;
+    for (let i = 0; i < forward.length; i++) {
+      const x = forward[i];
+      if (Math.abs(x.perp) > perpHalfwidth) continue;
+      if (x.fwd > maxFwd) continue;
+      if (x.fwd < bestFwd) { bestFwd = x.fwd; bestIdx = i; }
+    }
+    return bestIdx;
+  };
+
+  let bestIdx = pickInCorridor(CORRIDOR_HALFWIDTH_M, MAX_DIST_M);
+  // Fallback: widen corridor (catches the next-door neighbor when the
+  // exact building you're aimed at isn't in our index).
+  if (bestIdx < 0) bestIdx = pickInCorridor(CORRIDOR_FALLBACK_HALFWIDTH_M, MAX_DIST_M * 1.25);
+
+  const makeHit = (i) => i >= 0 && i < forward.length
+    ? rowToPhoto(forward[i].row, c, {
+        distance: forward[i].d,
+        offset: Math.abs(forward[i].ang),
+        bearing: forward[i].b,
       })
     : null;
 
-  return {
-    prev:    make(bestIdx - 1),
-    current: make(bestIdx),
-    next:    make(bestIdx + 1),
-  };
+  if (bestIdx >= 0) {
+    return {
+      mode:    "trio",
+      prev:    makeHit(bestIdx - 1),
+      current: makeHit(bestIdx),
+      next:    makeHit(bestIdx + 1),
+    };
+  }
+
+  // Peek mode: no building in even the wide corridor. Pick the nearest
+  // forward candidate on each side so the user sees which way to turn.
+  let nearestLeft = null, nearestRight = null;
+  for (const x of forward) {
+    if (x.ang < 0) {
+      if (!nearestLeft || x.d < nearestLeft.d) nearestLeft = x;
+    } else if (x.ang > 0) {
+      if (!nearestRight || x.d < nearestRight.d) nearestRight = x;
+    }
+  }
+  const peekLeft  = nearestLeft  ? makeHit(forward.indexOf(nearestLeft))  : null;
+  const peekRight = nearestRight ? makeHit(forward.indexOf(nearestRight)) : null;
+  if (!peekLeft && !peekRight) return null;
+  return { mode: "peek", peekLeft, peekRight };
 }
 
 /** Fallback: nearest-in-any-direction (for "turn around" hint). */
@@ -327,7 +382,7 @@ function rowToPhoto(row, c, extra = {}) {
   };
 }
 
-// ---------- Rendering (3-slide carousel) ----------
+// ---------- Rendering (persistent-DOM slide carousel) ----------
 //
 // slideRegistry maps BBL -> { el, hasFullRes, role, io } for every slide
 // currently in the DOM. We key by BBL (not by IO) so that when the user
@@ -336,10 +391,14 @@ function rowToPhoto(row, c, extra = {}) {
 // survives — the image src swaps, but the slide doesn't get recreated and
 // re-fly-in.
 //
-// On each scan we compute the desired trio (prev/current/next), then
-// reconcile:
-//   - Slides no longer in the trio get a .slot-far-* class and are
-//     removed 400 ms later, after the CSS transition slides them offscreen.
+// Each scan produces a "scene" (see pickScene) with two shapes:
+//   trio mode: prev + current + next, the normal 3-slide carousel.
+//   peek mode: peekLeft + peekRight, thin slivers at the screen edges
+//              telling the user to turn toward an off-axis photo.
+//
+// renderScene reconciles the registry against the desired scene:
+//   - Slides no longer desired get a .slot-far-* class and are removed
+//     400 ms later, after the CSS transition slides them offscreen.
 //     Direction = opposite of the user's turn direction (if you turn right,
 //     the stale slide exits to the LEFT of the viewport).
 //   - Desired slides that aren't in the registry are freshly appended.
@@ -350,56 +409,75 @@ function rowToPhoto(row, c, extra = {}) {
 //   - Existing slides just get their role class swapped — CSS handles
 //     the transform/filter interpolation.
 //
-// This persistent-DOM approach is what makes the transitions smooth: a
-// building that was "next" and becomes "center" has the SAME DOM node, so
-// the transition fires on a class change rather than a node replacement.
+// This is what makes transitions smooth: a building that was "next" and
+// becomes "center" has the SAME DOM node, so the transition fires on a
+// class change rather than a node replacement.
 
 let lastBbl = null;
 const slideRegistry = new Map(); // bbl -> { el, hasFullRes, role, io }
+
+// All slot classes that renderScene may apply/remove. Kept as a const so
+// adding a new slot class (e.g. slot-peek-*) is a one-line change.
+const SLOT_CLASSES = [
+  "slot-left", "slot-center", "slot-right",
+  "slot-far-left", "slot-far-right", "slot-exit",
+  "slot-peek-left", "slot-peek-right",
+];
 
 function hideEmptyHint() { emptyHint.hidden = true; }
 function showEmptyHint(text) { emptyHint.textContent = text; emptyHint.hidden = false; }
 
 /**
  * Pick the entry class for a NEW slide appearing in `role`.
- * Prev/next slots always enter from their own side; center slides enter
- * from the direction of the user's last turn.
+ * Slides that have a natural side (left/right, peek-left/peek-right) enter
+ * from that side. Center slides enter from the direction of the user's
+ * last turn.
  */
 function entryClassFor(role, turnDir) {
-  if (role === "left")  return "slot-far-left";
-  if (role === "right") return "slot-far-right";
+  if (role === "left"  || role === "peek-left")  return "slot-far-left";
+  if (role === "right" || role === "peek-right") return "slot-far-right";
   // role === "center" — enter from the turn direction.
   return turnDir === "left" ? "slot-far-left" : "slot-far-right";
 }
 
 /**
- * Pick the exit class for a slide LEAVING `oldRole`. Mirrors entryClassFor:
- * a prev that's leaving the left side exits left; a stale center exits to
- * the OPPOSITE side from the current turn (i.e. if the user is turning
- * right, the old center slides off to the left).
+ * Pick the exit class for a slide LEAVING `oldRole`. Side-anchored slides
+ * exit toward their own side. A stale center exits OPPOSITE to the current
+ * turn direction (turning right → old center slides off to the left).
  */
 function exitClassFor(oldRole, turnDir) {
-  if (oldRole === "left")  return "slot-far-left";
-  if (oldRole === "right") return "slot-far-right";
+  if (oldRole === "left"  || oldRole === "peek-left")  return "slot-far-left";
+  if (oldRole === "right" || oldRole === "peek-right") return "slot-far-right";
   return turnDir === "right" ? "slot-far-left" : "slot-far-right";
 }
 
-function renderTrio(trio) {
-  hideEmptyHint();
+/**
+ * Top-level renderer. Takes the output of pickScene and reconciles the DOM.
+ * Handles both "trio" and "peek" modes with a single codepath — the roles
+ * are just different entries in the `desired` map.
+ */
+function renderScene(scene) {
   photoWrap.classList.remove("empty");
 
   // Build desired state: bbl -> { role, hit }.
   const desired = new Map();
-  if (trio.prev)    desired.set(trio.prev.bbl,    { role: "left",   hit: trio.prev });
-  if (trio.current) desired.set(trio.current.bbl, { role: "center", hit: trio.current });
-  if (trio.next)    desired.set(trio.next.bbl,    { role: "right",  hit: trio.next });
+  if (scene.mode === "trio") {
+    if (scene.prev)    desired.set(scene.prev.bbl,    { role: "left",   hit: scene.prev });
+    if (scene.current) desired.set(scene.current.bbl, { role: "center", hit: scene.current });
+    if (scene.next)    desired.set(scene.next.bbl,    { role: "right",  hit: scene.next });
+  } else {
+    // peek mode
+    if (scene.peekLeft)  desired.set(scene.peekLeft.bbl,  { role: "peek-left",  hit: scene.peekLeft });
+    if (scene.peekRight) desired.set(scene.peekRight.bbl, { role: "peek-right", hit: scene.peekRight });
+  }
 
   // 1. Remove slides that are no longer desired — slide them off in the
-  //    direction opposite to the user's turn.
+  //    direction opposite to the user's turn (or to their own side for
+  //    peek/side-anchored slides).
   for (const [bbl, sl] of slideRegistry) {
     if (desired.has(bbl)) continue;
     const exit = exitClassFor(sl.role, lastTurnDir);
-    sl.el.classList.remove("slot-left", "slot-center", "slot-right", "slot-far-left", "slot-far-right");
+    sl.el.classList.remove(...SLOT_CLASSES);
     sl.el.classList.add(exit);
     const { el } = sl;
     setTimeout(() => el.remove(), 400);
@@ -411,7 +489,8 @@ function renderTrio(trio) {
     let sl = slideRegistry.get(bbl);
     if (!sl) {
       const el = createSlideEl(hit, role);
-      // Enter from offscreen in the direction the user is turning toward.
+      // Enter from offscreen — toward role's natural side, or user's turn
+      // direction for center slides.
       const entry = entryClassFor(role, lastTurnDir);
       el.classList.add(entry);
       photoWrap.appendChild(el);
@@ -430,24 +509,42 @@ function renderTrio(trio) {
     }
     sl.role = role;
     // Assign/swap role class — CSS transition animates the move.
-    sl.el.classList.remove("slot-left", "slot-center", "slot-right", "slot-far-left", "slot-far-right", "slot-exit");
+    sl.el.classList.remove(...SLOT_CLASSES);
     sl.el.classList.add(`slot-${role}`);
 
-    // Only the center slide bothers with full-res — side peeks are
-    // blurred+dimmed, thumbnail quality is invisible there. When a slide
+    // Only the center slide bothers with full-res — everything else is
+    // dimmed/blurred and thumbnail-quality is invisible. When a slide
     // transitions into center, upgrade its src to full.
     if (role === "center" && !sl.hasFullRes) {
       upgradeToFullRes(sl, hit);
     }
   }
 
-  // 3. Bottom card follows the center slide.
-  if (trio.current) updateBottomCard(trio.current);
+  // 3. Bottom chrome + overlay hint.
+  if (scene.mode === "trio" && scene.current) {
+    hideEmptyHint();
+    updateBottomCard(scene.current);
+  } else if (scene.mode === "peek") {
+    // No building directly ahead — tell the user to turn.
+    bottomCard.hidden = true;
+    const l = scene.peekLeft, r = scene.peekRight;
+    let hint;
+    if (l && r) {
+      const leftCloser = l.distance <= r.distance;
+      const near = leftCloser ? l : r;
+      hint = `No 1940s photo directly ahead.\nTurn ${leftCloser ? "left" : "right"} — a photo is ~${Math.round(near.distance)} m away.`;
+    } else if (l) {
+      hint = `No 1940s photo directly ahead.\nTurn left — a photo is ~${Math.round(l.distance)} m away.`;
+    } else {
+      hint = `No 1940s photo directly ahead.\nTurn right — a photo is ~${Math.round(r.distance)} m away.`;
+    }
+    showEmptyHint(hint);
+  }
 }
 
 /**
  * Swap the image src on an existing slide to a different IO (same BBL,
- * different angle). Used when pickTrio picks a different alt as "closest"
+ * different angle). Used when pickScene picks a different alt as "closest"
  * for a BBL that was already on screen — we want the node to persist so
  * it doesn't re-animate in.
  */
@@ -528,7 +625,7 @@ function upgradeToFullRes(sl, hit) {
 
 function clearAllSlides() {
   for (const [, sl] of slideRegistry) {
-    sl.el.classList.remove("slot-left", "slot-center", "slot-right", "slot-far-left", "slot-far-right");
+    sl.el.classList.remove(...SLOT_CLASSES);
     sl.el.classList.add("slot-exit");
     const { el } = sl;
     setTimeout(() => el.remove(), 400);
@@ -694,8 +791,10 @@ function onHeadingChange(h) {
 function onPositionChange(newPos) {
   userPos = newPos;
   centerBtn.hidden = true;
-  // If no manual override, keep the map centered on GPS.
-  if (mapReady && !manualOverride) {
+  // If no manual override AND the user isn't mid-swipe on the minimap,
+  // keep the map centered on GPS. Suppressing during drag avoids yanking
+  // the map out from under their finger as a background GPS update arrives.
+  if (mapReady && !manualOverride && !isDraggingMinimap) {
     map.jumpTo({ center: [newPos.lon, newPos.lat] });
   }
   requestScan();
@@ -717,8 +816,8 @@ function requestScan() {
 function runCandidateScan() {
   const pos = effectivePos();
   if (!pos || heading == null || !index) return;
-  const trio = pickTrio(pos.lat, pos.lon, heading);
-  if (trio) renderTrio(trio);
+  const scene = pickScene(pos.lat, pos.lon, heading);
+  if (scene) renderScene(scene);
   else renderNoCandidate(pos.lat, pos.lon, heading);
 }
 
@@ -760,31 +859,84 @@ function initMap() {
   // If the style fails (network blip), log and keep the rest of the app alive.
   map.on("error", (e) => console.warn("[minimap]", e?.error?.message || e));
 
-  // Tap-to-correct: one of the only useful workarounds for GPS error in the
-  // NYC street canyon. User taps the street they're actually on; that becomes
-  // the effective position until they reset.
-  bindMinimapTap();
+  // Two interaction modes, distinguished by motion distance:
+  //   tap  → jump the pin to the tapped spot (GPS correction, fast).
+  //   drag → pan the pin around live as the finger moves, commit on release.
+  // Both end up calling setManualOverride, which locks the pin until the user
+  // hits the reset button.
+  bindMinimapInteraction();
 }
 
-// Distinguishes "tap" from "drag" (ignore drags) and "long press" (ignore).
-function bindMinimapTap() {
-  let down = null;
+function bindMinimapInteraction() {
+  // Pointer state for the current gesture. `startCenter` captures the geo
+  // point under the pin at gesture-start; every mousemove re-derives the
+  // center from this anchor + pixel delta (absolute, not cumulative) so
+  // there's no drift from skipped events.
+  let start = null;
+  let dragged = false;
+  const DRAG_THRESHOLD_PX = 6; // below this, treat as a tap
+  const TAP_MAX_MS = 500;
+
   miniMapGl.addEventListener("pointerdown", (e) => {
-    down = { x: e.clientX, y: e.clientY, t: performance.now() };
-  });
-  miniMapGl.addEventListener("pointerup", (e) => {
-    if (!down) return;
-    const dx = e.clientX - down.x, dy = e.clientY - down.y;
-    const dt = performance.now() - down.t;
-    down = null;
-    if (Math.hypot(dx, dy) > 10) return;  // drag
-    if (dt > 500) return;                 // long press
     if (!map) return;
+    start = {
+      x: e.clientX,
+      y: e.clientY,
+      t: performance.now(),
+      startCenter: map.getCenter(),
+    };
+    dragged = false;
+    try { miniMapGl.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+  });
+
+  miniMapGl.addEventListener("pointermove", (e) => {
+    if (!start || !map) return;
+    const dx = e.clientX - start.x;
+    const dy = e.clientY - start.y;
+    if (!dragged) {
+      if (Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
+      dragged = true;
+      isDraggingMinimap = true; // suppress GPS-driven recenter while dragging
+    }
+    // Re-anchor to start, then compute the geo point that would appear at
+    // screen (cx + dx, cy + dy) and recenter there. That makes the geo
+    // location under the user's fingertip follow the finger exactly — the
+    // pin visually stays at the center while the map scrolls underneath.
+    // Two jumpTos in one handler settle into a single browser paint.
+    map.jumpTo({ center: [start.startCenter.lng, start.startCenter.lat] });
     const rect = miniMapGl.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    const lngLat = map.unproject([x, y]);
-    setManualOverride(lngLat.lat, lngLat.lng);
+    const target = map.unproject([rect.width / 2 + dx, rect.height / 2 + dy]);
+    map.jumpTo({ center: [target.lng, target.lat] });
+  });
+
+  const endGesture = (e) => {
+    if (!start) return;
+    const dt = performance.now() - start.t;
+    const dx = e.clientX - start.x;
+    const dy = e.clientY - start.y;
+    const wasDragged = dragged;
+    start = null;
+    dragged = false;
+    isDraggingMinimap = false;
+    if (!map) return;
+
+    if (wasDragged) {
+      // Commit the dragged-to center as the manual override.
+      const c = map.getCenter();
+      setManualOverride(c.lat, c.lng);
+    } else if (dt <= TAP_MAX_MS && Math.hypot(dx, dy) < 10) {
+      // Tap: unproject the click point directly.
+      const rect = miniMapGl.getBoundingClientRect();
+      const lngLat = map.unproject([e.clientX - rect.left, e.clientY - rect.top]);
+      setManualOverride(lngLat.lat, lngLat.lng);
+    }
+  };
+
+  miniMapGl.addEventListener("pointerup", endGesture);
+  miniMapGl.addEventListener("pointercancel", () => {
+    start = null;
+    dragged = false;
+    isDraggingMinimap = false;
   });
 }
 

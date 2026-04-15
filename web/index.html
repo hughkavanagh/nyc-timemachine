@@ -102,6 +102,26 @@
       filter: brightness(0.1) blur(6px);
       z-index: 0;
     }
+    /* Peek slivers — used when no building is "in front" but photos exist
+       to the side. We show only a ~13% strip of the image at the screen
+       edge so the user can see which direction to turn.
+       translateX(-87%) on a 100vw image leaves 13vw visible on the LEFT
+       of the screen, showing the RIGHT edge of the photo — the part of
+       the building nearest to where the user is pointing. */
+    .slide.slot-peek-left {
+      transform: translateX(-87%) scale(1);
+      filter: brightness(0.5) blur(1px);
+      opacity: 1;
+      z-index: 2;
+      pointer-events: none;
+    }
+    .slide.slot-peek-right {
+      transform: translateX(87%) scale(1);
+      filter: brightness(0.5) blur(1px);
+      opacity: 1;
+      z-index: 2;
+      pointer-events: none;
+    }
 
     /* Shimmer overlay shown while full-res is loading behind a thumbnail. */
     .shimmer {
