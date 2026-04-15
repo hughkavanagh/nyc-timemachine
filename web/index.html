@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>1940s Lens</title>
+  <style>
+    :root {
+      --bg: #000;
+      --fg: #fff;
+      --muted: rgba(255,255,255,0.7);
+      --bubble: rgba(0,0,0,0.5);
+      --bubble-border: rgba(255,255,255,0.12);
+    }
+    * { box-sizing: border-box; }
+    /* ID selectors below use display:flex/grid which would beat the UA
+       `[hidden]{display:none}` rule — override explicitly so `hidden`
+       attribute wins. */
+    [hidden] { display: none !important; }
+    html, body {
+      margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+      font-family: -apple-system, system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      min-height: 100dvh;
+    }
+
+    /* ---------- Photo fills the viewport width ---------- */
+    #photoWrap {
+      width: 100vw;
+      display: flex; justify-content: center; align-items: flex-start;
+      background: #000;
+      min-height: 100dvh;
+    }
+    #photoWrap img {
+      width: 100vw;
+      height: auto;
+      display: block;
+    }
+    #photoWrap.empty { min-height: 100dvh; }
+    #photoWrap a { position: relative; display: block; width: 100%; }
+
+    /* Shimmer overlay shown while full-res is loading behind a thumbnail. */
+    .shimmer {
+      position: absolute; inset: 0;
+      background: linear-gradient(100deg,
+        rgba(255,255,255,0)    0%,
+        rgba(255,255,255,0.08) 45%,
+        rgba(255,255,255,0.18) 50%,
+        rgba(255,255,255,0.08) 55%,
+        rgba(255,255,255,0)   100%);
+      background-size: 250% 100%;
+      animation: shimmer 1.4s linear infinite;
+      pointer-events: none;
+      mix-blend-mode: overlay;
+      opacity: 1;
+      transition: opacity 220ms ease;
+    }
+    .shimmer.fade-out { opacity: 0; }
+    @keyframes shimmer {
+      0%   { background-position: 200% 0; }
+      100% { background-position: -200% 0; }
+    }
+
+    /* Portrait-only: if the device is in landscape (small height),
+       hide the main UI and ask them to rotate. */
+    #rotateHint {
+      display: none;
+      position: fixed; inset: 0;
+      align-items: center; justify-content: center; flex-direction: column;
+      gap: 10px;
+      background: rgba(0,0,0,0.92);
+      color: var(--fg); text-align: center; padding: 20px;
+      z-index: 100;
+    }
+    #rotateHint svg { width: 48px; height: 48px; opacity: 0.8; }
+    #rotateHint p { margin: 0; font-size: 1rem; }
+    @media (max-height: 480px) and (orientation: landscape) {
+      #rotateHint { display: flex; }
+      #topPill, #bottomCard, #centerBtn, #photoWrap, #desktopCtrl { visibility: hidden; }
+    }
+
+    /* ---------- Shared bubble style ---------- */
+    .bubble {
+      background: var(--bubble);
+      border: 1px solid var(--bubble-border);
+      backdrop-filter: blur(14px) saturate(140%);
+      -webkit-backdrop-filter: blur(14px) saturate(140%);
+      color: var(--fg);
+      box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+    }
+
+    /* ---------- Top pill: title + compass ---------- */
+    #topPill {
+      position: fixed;
+      top: calc(env(safe-area-inset-top, 0) + 14px);
+      left: 50%; transform: translateX(-50%);
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 14px;
+      border-radius: 999px;
+      font-size: 0.95rem;
+      z-index: 20;
+    }
+    #topPill .title { font-weight: 600; letter-spacing: 0.3px; }
+    #topPill .compass {
+      width: 20px; height: 20px; position: relative;
+      display: inline-flex; align-items: center; justify-content: center;
+    }
+    #topPill .compass svg {
+      width: 100%; height: 100%;
+      transform: rotate(0deg);
+      transition: transform 120ms linear;
+    }
+    #topPill .compass.idle svg { opacity: 0.35; }
+
+    /* ---------- Bottom card: address + alts ---------- */
+    #bottomCard {
+      position: fixed;
+      left: 50px; right: 50px;
+      bottom: calc(env(safe-area-inset-bottom, 0) + 20px);
+      padding: 16px 20px;
+      border-radius: 18px;
+      z-index: 20;
+    }
+    #bottomCard .cardHead {
+      display: flex; align-items: center; gap: 10px;
+    }
+    #bottomCard .addr {
+      margin: 0; font-size: 1.1rem; font-weight: 600;
+      line-height: 1.25; letter-spacing: 0.2px;
+      flex: 1; min-width: 0;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    #bottomCard .cardActions {
+      display: flex; gap: 4px; align-items: center;
+      flex: 0 0 auto;
+    }
+    #bottomCard .iconBtn {
+      width: 28px; height: 28px; padding: 0; border-radius: 50%;
+      background: rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.15);
+      color: var(--fg);
+      font-size: 0.85rem; font-weight: 600;
+      font-family: Georgia, "Times New Roman", serif;
+      font-style: italic;
+      display: inline-flex; align-items: center; justify-content: center;
+      cursor: pointer;
+      transition: background 120ms linear, transform 160ms ease;
+    }
+    #bottomCard .iconBtn:hover { background: rgba(255,255,255,0.18); }
+    #bottomCard .iconBtn svg {
+      width: 16px; height: 16px;
+      transition: transform 200ms ease;
+    }
+    /* Collapsed: flip the chevron. */
+    #bottomCard.collapsed #collapseBtn svg { transform: rotate(180deg); }
+    #bottomCard.collapsed .cardBody,
+    #bottomCard.collapsed .infoPanel { display: none; }
+
+    #bottomCard .cardBody { margin-top: 4px; }
+    #bottomCard .sub {
+      margin: 2px 0 0; font-size: 0.82rem; color: var(--muted);
+    }
+    #bottomCard .altsHint {
+      margin: 10px 0 6px; font-size: 0.72rem; color: var(--muted);
+    }
+    #bottomCard .alts {
+      display: flex; gap: 6px; flex-wrap: wrap;
+    }
+    #bottomCard .alts a {
+      width: 48px; height: 48px; border-radius: 6px; overflow: hidden;
+      background: rgba(0,0,0,0.4);
+      border: 1.5px solid transparent;
+      display: block;
+    }
+    #bottomCard .alts a.current { border-color: rgba(255,255,255,0.85); }
+    #bottomCard .alts img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+    #bottomCard .infoPanel {
+      margin-top: 12px; padding-top: 10px;
+      border-top: 1px solid rgba(255,255,255,0.12);
+      color: var(--muted); font-size: 0.75rem; line-height: 1.45;
+    }
+    #bottomCard .infoPanel p { margin: 0; }
+    #bottomCard .infoPanel b { color: var(--fg); font-weight: 600; }
+
+    /* ---------- Centered action button (enable-location) ---------- */
+    #centerBtn {
+      position: fixed; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      z-index: 30;
+      pointer-events: none;
+    }
+    #centerBtn > button {
+      pointer-events: auto;
+      background: var(--bubble);
+      border: 1px solid var(--bubble-border);
+      backdrop-filter: blur(14px) saturate(140%);
+      -webkit-backdrop-filter: blur(14px) saturate(140%);
+      color: var(--fg);
+      padding: 14px 24px;
+      border-radius: 999px;
+      font-size: 1rem; font-weight: 600;
+      cursor: pointer;
+      box-shadow: 0 6px 24px rgba(0,0,0,0.35);
+    }
+    #centerBtn > button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* ---------- Desktop heading slider (hidden unless needed) ---------- */
+    #desktopCtrl {
+      position: fixed;
+      left: 50px; right: 50px;
+      bottom: calc(env(safe-area-inset-bottom, 0) + 20px);
+      display: none;
+      padding: 10px 14px;
+      border-radius: 14px;
+      z-index: 15;
+    }
+    #desktopCtrl label {
+      color: var(--muted); font-size: 0.72rem;
+      display: block; margin-bottom: 6px;
+    }
+    #desktopCtrl input { width: 100%; accent-color: #fff; }
+
+    @media (max-width: 420px) {
+      #bottomCard, #desktopCtrl { left: 16px; right: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Full-width photo (or empty black when no candidate) -->
+  <div id="photoWrap" class="empty"></div>
+
+  <!-- Top pill: title + compass -->
+  <div id="topPill" class="bubble">
+    <span class="title">1940s Lens</span>
+    <div class="compass idle" id="compass">
+      <svg id="compassSvg" viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path fill-rule="evenodd" clip-rule="evenodd" d="M77.8184 59.5508C77.842 60.0693 77.7744 60.5909 77.6094 61.0898L64.0898 101.95L64.0254 102.133C62.6298 105.841 57.3238 105.792 55.9971 102.059L55.9365 101.875L43.248 61.0146C43.1003 60.5386 43.0401 60.0433 43.0625 59.5508C43.079 59.188 43.1382 58.8263 43.2471 58.4756L55.9355 17.6152C57.1707 13.6388 62.7804 13.5872 64.0889 17.54L77.6094 58.4004C77.7331 58.7745 77.8007 59.1621 77.8184 59.5508ZM59.7559 100.688C59.7816 100.771 59.8072 100.808 59.8145 100.818C59.822 100.829 59.8284 100.835 59.8359 100.84C59.8563 100.854 59.9199 100.886 60.0225 100.887C60.1248 100.888 60.1891 100.858 60.21 100.844C60.2177 100.839 60.2236 100.832 60.2314 100.822C60.2387 100.813 60.2645 100.776 60.292 100.693L72.5811 63.5508H48.2236L59.7559 100.688Z" fill="white"/>
+        <path fill-rule="evenodd" clip-rule="evenodd" d="M60 0C93.1371 0 120 26.8629 120 60C120 93.1371 93.1371 120 60 120C26.8629 120 0 93.1371 0 60C0 26.8629 26.8629 0 60 0ZM60 4C29.0721 4 4 29.0721 4 60C4 90.9279 29.0721 116 60 116C90.9279 116 116 90.9279 116 60C116 29.0721 90.9279 4 60 4Z" fill="white"/>
+      </svg>
+    </div>
+  </div>
+
+  <!-- Bottom card: address + alternates (only when a hit is selected) -->
+  <div id="bottomCard" class="bubble" hidden>
+    <div class="cardHead">
+      <p class="addr" id="addrText"></p>
+      <div class="cardActions">
+        <button id="infoBtn" class="iconBtn" aria-label="About this photo" title="About">i</button>
+        <button id="collapseBtn" class="iconBtn" aria-label="Collapse" title="Collapse">
+          <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <path d="M5 8l5 5 5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+    <div class="cardBody">
+      <p class="sub" id="subText"></p>
+      <p class="altsHint" id="altsHint" hidden></p>
+      <div class="alts" id="altsStrip"></div>
+    </div>
+    <div class="infoPanel" id="infoPanel" hidden>
+      <p>Photos courtesy of the <b>NYC Municipal Archives</b>, 1940s Tax Photographs collection. Placed on the map using NYC MapPLUTO.</p>
+    </div>
+  </div>
+
+  <!-- Center enable-location button, only when we need a user gesture -->
+  <div id="centerBtn">
+    <button id="startBtn">Enable location</button>
+  </div>
+
+  <!-- Desktop-only heading slider (shown if no compass detected) -->
+  <div id="desktopCtrl" class="bubble">
+    <label id="desktopCtrlLabel">No compass — drag to change heading</label>
+    <input type="range" id="headingSlider" min="0" max="359" value="0">
+  </div>
+
+  <!-- Portrait-only: shown on landscape phones as a CSS-only overlay. -->
+  <div id="rotateHint">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="7" y="3" width="10" height="18" rx="2" ry="2"/>
+      <path d="M12 18h.01"/>
+      <path d="M3 7a9 9 0 0 1 9-4"/>
+      <polyline points="3 3 3 7 7 7"/>
+    </svg>
+    <p>Please rotate your phone to portrait</p>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

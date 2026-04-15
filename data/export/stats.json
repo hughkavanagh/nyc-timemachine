@@ -1,15 +1,17 @@
 {
-  "generated_at": 1776192424,
-  "total_photos_scraped": 104907,
-  "unique_bbls": 90522,
-  "placed_bbls": 83873,
+  "generated_at": 1776261237,
+  "total_photos_scraped": 633227,
+  "unique_bbls": 585552,
+  "placed_bbls": 561598,
   "match_breakdown": {
-    "block_nearest_lot": 42206,
-    "lot": 54985,
-    "none": 7716
+    "block_nearest_lot": 119853,
+    "lot": 487185,
+    "none": 26189
   },
   "scrape_pages_done": {
     "1": 3531,
-    "2": 913
+    "2": 2924,
+    "3": 11365,
+    "4": 9131
   }
 }

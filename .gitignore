@@ -1,9 +1,17 @@
 .venv/
 __pycache__/
 *.pyc
-data/*.sqlite
-data/*.sqlite-*
+
+# SQLite databases — anywhere in the tree.
+# These are large (>100 MB) and GitHub rejects files >100 MB.
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Large source data — rebuilt from scrapers/downloads, not committed.
 data/mappluto/
+web/data/data/
+
 logs/
 .DS_Store
 .claude/launch.json

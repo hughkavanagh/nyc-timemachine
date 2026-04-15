@@ -136,6 +136,9 @@ def open_db(path: Path) -> sqlite3.Connection:
     conn.executescript(SCHEMA)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    # Wait up to 30s for other writers instead of instant-failing. Required
+    # since fetch_pluto / geocode / export may run concurrently.
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 

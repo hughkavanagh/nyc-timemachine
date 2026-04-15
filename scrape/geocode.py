@@ -57,6 +57,7 @@ def open_db() -> sqlite3.Connection:
     conn.executescript(SCHEMA)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
