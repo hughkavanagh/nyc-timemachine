@@ -40,9 +40,10 @@ const ANGLE_WEIGHT = 2.5; // ranking weight: 1° misalignment ≈ 2.5 m
 
 // Map tile style. OpenFreeMap is free, no API key, attribution baked in.
 const MAP_STYLE = "https://tiles.openfreemap.org/styles/dark";
-// Zoom 16.5 shows ~2 blocks around the user — enough context to see which
-// street you're on and correct a bad GPS fix by tapping the right one.
-const MAP_ZOOM  = 16.5;
+// Zoom 15.8 shows ~4 surrounding blocks on the 110 px porthole — enough
+// context to see which street you're on (with labels) and correct a bad
+// GPS fix by tapping the right one.
+const MAP_ZOOM  = 15.8;
 
 // Candidate scan is throttled — no faster than once every SCAN_MIN_MS.
 // With 561k rows the scan takes ~15 ms on mobile, so 80 ms keeps us well
@@ -170,6 +171,28 @@ function colIdx() {
   return Object.fromEntries(index.columns.map((c, i) => [c, i]));
 }
 
+// Radius (m) inside which we look at neighboring buildings to infer which
+// street the user is ON. 35 m easily covers both sides of an NYC street
+// (most are 15–25 m wide curb-to-curb) without bleeding into buildings on
+// the next parallel avenue.
+const USER_STREET_RADIUS_M = 35;
+
+/**
+ * Extract a street name from a MapPLUTO-style address like "123 PRINCE ST"
+ * or "456-460 BROADWAY". Returns uppercase street name (unit-agnostic), or
+ * null if we can't parse one. Used for same-street filtering.
+ */
+function extractStreet(addr) {
+  if (!addr) return null;
+  const s = String(addr).trim().toUpperCase();
+  if (!s) return null;
+  // Drop the leading house-number token(s). MapPLUTO formats are things
+  // like "123 PRINCE ST", "123-125 PRINCE ST", "123A PRINCE ST".
+  const m = s.match(/^[\d][\dA-Z\-\/]*\s+(.+)$/);
+  const street = m ? m[1] : s;
+  return street.trim() || null;
+}
+
 /**
  * Pick up to three adjacent-by-bearing candidates around the user's heading:
  *   - current: best-scored candidate within the view cone
@@ -181,19 +204,47 @@ function colIdx() {
  *
  * Deduped by BBL so two photos of the same building (alts) don't eat the
  * prev/next slots — alts still live inside the bottom-card strip.
+ *
+ * Same-street filter: we also infer which street the user is standing on
+ * (the most common street among buildings within USER_STREET_RADIUS_M) and
+ * restrict candidates to buildings on that street. At corners, the nearby
+ * set spans two streets and both are kept — so cross-street photos still
+ * appear when you actually are at the intersection.
  */
 function pickTrio(lat, lon, hdg) {
   const c = colIdx();
-  // First pass: buildings within a slightly expanded radius for peeks.
+  // First pass: collect candidates AND tally which streets are within the
+  // "user is on this street" radius. One loop; keeping both passes folded
+  // together so we don't iterate 561k rows twice per scan.
   const cands = [];
+  const streetTally = new Map(); // streetName -> count within USER_STREET_RADIUS_M
   for (const r of index.data) {
     const plat = r[c.lat], plon = r[c.lon];
     const d = distMeters(lat, lon, plat, plon);
     if (d > NEIGHBOR_DIST_M) continue;
     const b = bearingDeg(lat, lon, plat, plon);
     cands.push({ row: r, d, b });
+    if (d <= USER_STREET_RADIUS_M) {
+      const s = extractStreet(r[c.addr]);
+      if (s) streetTally.set(s, (streetTally.get(s) || 0) + 1);
+    }
   }
   if (!cands.length) return null;
+
+  // Determine the user's "street set". If one street dominates, use only it.
+  // If two streets are comparably represented (user at a corner), keep both.
+  // No street data nearby → skip the filter (be lenient, show the best we have).
+  let userStreetSet = null;
+  if (streetTally.size > 0) {
+    const ranked = [...streetTally.entries()].sort((a, b) => b[1] - a[1]);
+    const top = ranked[0][1];
+    // Keep streets with at least half the top count (min 2 hits to count as
+    // a "real" cross-street — one stray parcel shouldn't unlock an avenue).
+    const keep = ranked.filter(([, n]) => n === top || n >= Math.max(2, top / 2))
+                       .slice(0, 2)
+                       .map(([s]) => s);
+    userStreetSet = new Set(keep);
+  }
 
   // Dedupe by BBL (keep closest photo per BBL).
   const perBbl = new Map();
@@ -202,7 +253,18 @@ function pickTrio(lat, lon, hdg) {
     const existing = perBbl.get(bbl);
     if (!existing || x.d < existing.d) perBbl.set(bbl, x);
   }
-  const uniq = Array.from(perBbl.values());
+  let uniq = Array.from(perBbl.values());
+
+  // Apply same-street filter. A candidate whose address doesn't parse is
+  // KEPT (we don't punish bad data), but anything on a clearly-different
+  // street is dropped.
+  if (userStreetSet && userStreetSet.size > 0) {
+    uniq = uniq.filter(x => {
+      const s = extractStreet(x.row[c.addr]);
+      return !s || userStreetSet.has(s);
+    });
+    if (!uniq.length) return null;
+  }
 
   // Signed angle from heading; keep only the forward half so buildings
   // behind the user don't count as "prev/next".
@@ -755,30 +817,57 @@ function placeNorthLabel(h) {
   miniMapNorth.style.transform = `translate(${x}px, ${y}px)`;
 }
 
-// Post-load tweak: (a) brighten road fills to clean white so street-level
-// detail is readable on a 110 px porthole, and (b) hide the dark "casing"
-// layers (the outline lines that flank every road) because once the fill
-// is white, the casings read as distracting dotted white lines on either
-// side of every street. Matched by layer-id heuristic — OpenFreeMap uses
-// names like `highway_primary`, `highway_primary_casing`, etc.
+// Post-load tweak: take OpenFreeMap's dark style and make it readable on a
+// 110 px porthole. Three things:
+//
+//   (a) Road fills → clean white, with dash arrays cleared. A stock layer
+//       like `highway_path` ships with `line-dasharray: [1.5, 1.5]`; if we
+//       just recolor without clearing dash, it paints as a dotted white
+//       line on top of the street, which looked exactly like sidewalk dashes.
+//   (b) "Casing" layers (the outline lines that flank every road) → hidden
+//       entirely. At 110 px they'd read as doubled edges around every road.
+//       Pedestrian `highway_path` also falls in here — at this zoom, trails
+//       inside parks are just distracting confetti.
+//   (c) Road-name symbols → white at ~70% opacity with a black halo so they
+//       stay readable without dominating. Stock is `rgb(80,78,78)` which is
+//       invisible on the dark basemap.
 function cleanupMapStyle() {
   if (!map) return;
   const style = map.getStyle();
   if (!style?.layers) return;
   for (const layer of style.layers) {
-    if (layer.type !== "line") continue;
     const id = (layer.id || "").toLowerCase();
-    const isRoadish = /(highway|road|street|path|motorway|trunk|primary|secondary|tertiary|residential|service|transportation)/.test(id);
-    if (!isRoadish) continue;
-    const isCasing = /(casing|outline|bridge_casing|tunnel_casing)/.test(id);
-    try {
-      if (isCasing) {
-        map.setLayoutProperty(layer.id, "visibility", "none");
-      } else {
-        map.setPaintProperty(layer.id, "line-color", "#f2f2f2");
-        map.setPaintProperty(layer.id, "line-opacity", 1);
-      }
-    } catch { /* some layers don't accept updates — ignore */ }
+
+    if (layer.type === "line") {
+      const isRoadish = /(highway|road|street|motorway|trunk|primary|secondary|tertiary|residential|service|transportation)/.test(id);
+      if (!isRoadish) continue;
+      // Hide the thin dark outlines and the pedestrian/path overlays.
+      const shouldHide = /(casing|outline|path|pier|pedestrian|footway|track)/.test(id);
+      try {
+        if (shouldHide) {
+          map.setLayoutProperty(layer.id, "visibility", "none");
+        } else {
+          map.setPaintProperty(layer.id, "line-color", "#f2f2f2");
+          map.setPaintProperty(layer.id, "line-opacity", 1);
+          // Clear any dash pattern — setting to [1,0] forces solid strokes.
+          // `null` would reset to default (empty), which also works, but
+          // `[1,0]` is the documented explicit "solid line" incantation.
+          map.setPaintProperty(layer.id, "line-dasharray", [1, 0]);
+        }
+      } catch { /* some layers don't accept updates — ignore */ }
+    } else if (layer.type === "symbol") {
+      // Street-name labels. OpenFreeMap tags them via source-layer
+      // `transportation_name`; the id pattern is `highway_name_*`.
+      const isRoadName = /(highway_name|road_name|street_name|transportation_name)/.test(id)
+                       || (layer["source-layer"] === "transportation_name");
+      if (!isRoadName) continue;
+      try {
+        map.setLayoutProperty(layer.id, "visibility", "visible");
+        map.setPaintProperty(layer.id, "text-color", "rgba(255,255,255,0.72)");
+        map.setPaintProperty(layer.id, "text-halo-color", "rgba(0,0,0,0.95)");
+        map.setPaintProperty(layer.id, "text-halo-width", 1.2);
+      } catch { /* ignore */ }
+    }
   }
 }
 
