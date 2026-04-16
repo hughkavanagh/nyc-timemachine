@@ -106,23 +106,40 @@
       opacity: 0;
       z-index: 0;
     }
-    /* Center entry — a new focal photo fades in AT the center (not from
-       the side). Starts slightly scaled-down + blurred, animates to 1.0.
-       This matches the user-visible contract: "the photo for what I'm
-       pointing at always appears centered". */
-    .slide.slot-enter-center {
-      transform: translateX(0) scale(0.92);
-      filter: brightness(0.4) blur(6px);
-      opacity: 0;
-      z-index: 3;
+    /* Center entry — a brand-new focal photo slides in from the side the
+       user is turning TOWARDS, pushing the outgoing photo off the opposite
+       edge. Scale stays at 1 throughout so the image never shifts on Y
+       (the top-anchored transform-origin would otherwise make a shrinking
+       image appear to "move up"). z-index 4 keeps the incoming photo
+       above the outgoing one during any overlap. */
+    .slide.slot-enter-from-right {
+      transform: translateX(100%) scale(1);
+      filter: none;
+      opacity: 1;
+      z-index: 4;
     }
-    /* Exit state — slide fades/shrinks out in place before being removed.
-       Used for the stale center when the carousel moves on. */
-    .slide.slot-exit {
+    .slide.slot-enter-from-left {
+      transform: translateX(-100%) scale(1);
+      filter: none;
+      opacity: 1;
+      z-index: 4;
+    }
+    /* Center exit — stale focal photo is PUSHED off to the opposite side
+       of the turn. Pure horizontal slide, no scale change, so the image
+       stays centered on Y all the way out. Fade + slight dim so the
+       trailing edge isn't a hard cut. z-index below slot-center so the
+       new photo is visibly on top during any overlap. */
+    .slide.slot-exit-to-left {
+      transform: translateX(-100%) scale(1);
+      filter: brightness(0.6) blur(1px);
       opacity: 0;
-      transform: translateX(0) scale(0.55);
-      filter: brightness(0.1) blur(6px);
-      z-index: 0;
+      z-index: 2;
+    }
+    .slide.slot-exit-to-right {
+      transform: translateX(100%) scale(1);
+      filter: brightness(0.6) blur(1px);
+      opacity: 0;
+      z-index: 2;
     }
 
     /* Shimmer overlay shown while full-res is loading behind a thumbnail. */
@@ -146,6 +163,80 @@
       0%   { background-position: 200% 0; }
       100% { background-position: -200% 0; }
     }
+
+    /* ---------- Desktop overlay ----------
+       Shown when the page is loaded on a non-touch/fine-pointer device.
+       Full-viewport message telling the user to open on their phone, with
+       a small "continue anyway" link that lets developers use the
+       heading-slider testing path. Toggled from JS by adding
+       body.show-desktop-overlay. */
+    #desktopOverlay {
+      display: none;
+      position: fixed; inset: 0;
+      z-index: 200;
+      background: #000;
+      color: var(--fg);
+      padding: 40px 32px;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+    }
+    body.show-desktop-overlay #desktopOverlay { display: flex; }
+    /* When the overlay is up, silence the rest of the UI so keyboard focus
+       and screen readers don't wander into hidden panels. */
+    body.show-desktop-overlay #topPill,
+    body.show-desktop-overlay #bottomCard,
+    body.show-desktop-overlay #centerBtn,
+    body.show-desktop-overlay #photoWrap,
+    body.show-desktop-overlay #miniMap,
+    body.show-desktop-overlay #desktopCtrl,
+    body.show-desktop-overlay #emptyHint { visibility: hidden; }
+
+    .desktopOverlay-inner {
+      max-width: 440px;
+      display: flex; flex-direction: column; align-items: center;
+    }
+    .desktopOverlay-icon {
+      width: 56px; height: 56px;
+      opacity: 0.85;
+      margin-bottom: 24px;
+    }
+    #desktopOverlay h1 {
+      margin: 0 0 14px;
+      font-size: 1.45rem;
+      font-weight: 600;
+      letter-spacing: 0.3px;
+    }
+    #desktopOverlay p {
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 0.95rem;
+      line-height: 1.55;
+    }
+    #desktopOverlay .desktopOverlay-host {
+      margin-top: 18px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.82rem;
+      letter-spacing: 0.4px;
+      color: rgba(255,255,255,0.55);
+      padding: 8px 14px;
+      border: 1px solid var(--bubble-border);
+      border-radius: 999px;
+    }
+    #desktopOverlay small {
+      display: block;
+      margin-top: 28px;
+      font-size: 0.72rem;
+      letter-spacing: 0.5px;
+      color: rgba(255,255,255,0.3);
+    }
+    #desktopOverlay small a {
+      color: rgba(255,255,255,0.55);
+      text-decoration: underline;
+      text-underline-offset: 2px;
+      cursor: pointer;
+    }
+    #desktopOverlay small a:hover { color: rgba(255,255,255,0.85); }
 
     /* Portrait-only: if the device is in landscape (small height),
        hide the main UI and ask them to rotate. */
@@ -496,6 +587,25 @@
   <div id="desktopCtrl" class="bubble">
     <label id="desktopCtrlLabel">No compass — drag to change heading</label>
     <input type="range" id="headingSlider" min="0" max="359" value="0">
+  </div>
+
+  <!-- Desktop-only: shown when the page is opened on a non-touch /
+       large-pointer device. A small "continue" link under it keeps the
+       desktop preview (heading slider) reachable for testing. Toggled
+       from app.js via body.show-desktop-overlay. -->
+  <div id="desktopOverlay" aria-hidden="true">
+    <div class="desktopOverlay-inner">
+      <svg class="desktopOverlay-icon" viewBox="0 0 24 24" fill="none"
+           stroke="currentColor" stroke-width="1.4"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="6.5" y="2" width="11" height="20" rx="2.2"/>
+        <path d="M11 18h2"/>
+      </svg>
+      <h1>Open on your phone</h1>
+      <p>1940s Lens points your phone's camera direction at the city, then serves up a 1940s tax photo of whichever building you're facing. It needs a real compass and GPS, so it doesn't work on a desktop browser.</p>
+      <p class="desktopOverlay-host">1940s-lens.netlify.app</p>
+      <small><a id="desktopContinue" href="#">Continue in preview mode</a></small>
+    </div>
   </div>
 
   <!-- Portrait-only: shown on landscape phones as a CSS-only overlay. -->

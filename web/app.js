@@ -136,6 +136,44 @@ const miniMap       = el("miniMap");
 const miniMapGl     = el("miniMapGl");
 const miniMapNorth  = el("miniMapNorth");
 const miniMapReset  = el("miniMapReset");
+const desktopOverlay    = el("desktopOverlay");
+const desktopContinue   = el("desktopContinue");
+
+// ---------- Desktop gate ----------
+//
+// The app depends on a compass + GPS and is meaningless on a laptop, so we
+// show a full-viewport overlay on desktop rather than letting the user
+// poke at a broken experience. Detection prefers primary-pointer coarseness
+// (`(pointer: coarse)`), which matches phones and tablets but not
+// mouse-driven laptops — even Chromebooks with touchscreens typically
+// report a fine primary pointer. The `?debug` URL flag and a "Continue in
+// preview mode" link both bypass it so the slider testing path stays
+// reachable.
+function isLikelyMobile() {
+  if (DEBUG) return true;
+  // Primary pointer is touch-sized → phone/tablet. Desktop browsers,
+  // including touchscreen laptops where the mouse is primary, report fine.
+  try {
+    if (window.matchMedia && window.matchMedia("(pointer: coarse)").matches) return true;
+  } catch { /* old browsers without matchMedia — fall through */ }
+  // Fallback for browsers that don't support `pointer: coarse`: any touch
+  // support + narrow viewport is a decent mobile signal.
+  const hasTouch = ("ontouchstart" in window) || navigator.maxTouchPoints > 0;
+  if (hasTouch && window.innerWidth <= 900) return true;
+  return false;
+}
+
+if (!isLikelyMobile() && desktopOverlay) {
+  document.body.classList.add("show-desktop-overlay");
+  desktopOverlay.setAttribute("aria-hidden", "false");
+}
+if (desktopContinue) {
+  desktopContinue.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    document.body.classList.remove("show-desktop-overlay");
+    desktopOverlay?.setAttribute("aria-hidden", "true");
+  });
+}
 
 // ---------- Geo math ----------
 const D2R = Math.PI / 180;
@@ -489,9 +527,10 @@ const slideRegistry = new Map(); // bbl -> { el, hasFullRes, role, io }
 // adding a new slot class (e.g. slot-peek-*) is a one-line change.
 const SLOT_CLASSES = [
   "slot-left", "slot-center", "slot-right",
-  "slot-far-left", "slot-far-right", "slot-exit",
+  "slot-far-left", "slot-far-right",
   "slot-peek-left", "slot-peek-right",
-  "slot-enter-center",
+  "slot-enter-from-left", "slot-enter-from-right",
+  "slot-exit-to-left",    "slot-exit-to-right",
 ];
 
 function hideEmptyHint() { emptyHint.hidden = true; }
@@ -500,28 +539,34 @@ function showEmptyHint(text) { emptyHint.textContent = text; emptyHint.hidden = 
 /**
  * Pick the entry class for a NEW slide appearing in `role`.
  * Side-anchored slides (left/right, peek-left/peek-right) enter from their
- * own far-side. Center slides fade in AT the center — never slide in from
- * the side — because the user's requested behavior is that images always
- * be centered and "load in from the center", regardless of which way the
- * phone is turning.
+ * own far-side. Center slides slide IN from the side the user is turning
+ * TOWARDS — this makes brand-new-center transitions (peek→trio, big jumps)
+ * feel like the same "push across the row of buildings" motion as a
+ * regular trio shift, where the new center replaces the old one rather
+ * than fading in over it.
  */
-function entryClassFor(role /*, turnDir */) {
+function entryClassFor(role, turnDir) {
   if (role === "left"  || role === "peek-left")  return "slot-far-left";
   if (role === "right" || role === "peek-right") return "slot-far-right";
-  // role === "center" — fade in at center, scaled slightly down.
-  return "slot-enter-center";
+  // role === "center" — the new focal photo enters from the side the user
+  // is turning toward. Turning right → the new building was on the right,
+  // so it slides in from the right. Default "right" matches the startup
+  // value of lastTurnDir, so the very first center arrival has a direction.
+  return turnDir === "left" ? "slot-enter-from-left" : "slot-enter-from-right";
 }
 
 /**
  * Pick the exit class for a slide LEAVING `oldRole`. Side-anchored slides
- * exit toward their own side. A stale CENTER slide fades out at the
- * center (same symmetry as the entry) — it does not slide off to a side.
+ * exit toward their own side. A stale CENTER slide is PUSHED off to the
+ * opposite side of the turn — turning right pushes the old center out to
+ * the left, and vice versa — so the transition reads as "new photo
+ * pushes old photo off-screen" rather than a fade at the center.
  */
-function exitClassFor(oldRole /*, turnDir */) {
+function exitClassFor(oldRole, turnDir) {
   if (oldRole === "left"  || oldRole === "peek-left")  return "slot-far-left";
   if (oldRole === "right" || oldRole === "peek-right") return "slot-far-right";
-  // oldRole === "center" — fade/shrink at center, via slot-exit.
-  return "slot-exit";
+  // oldRole === "center" — push off to the OPPOSITE side of the turn.
+  return turnDir === "left" ? "slot-exit-to-right" : "slot-exit-to-left";
 }
 
 /**
@@ -706,9 +751,13 @@ function upgradeToFullRes(sl, hit) {
 }
 
 function clearAllSlides() {
+  // Clear-all happens on peek→no-photo transitions or on hard resets. Push
+  // everything off to the side opposite the user's last turn so the motion
+  // matches regular center exits instead of a fade-at-center.
+  const exitClass = lastTurnDir === "left" ? "slot-exit-to-right" : "slot-exit-to-left";
   for (const [, sl] of slideRegistry) {
     sl.el.classList.remove(...SLOT_CLASSES);
-    sl.el.classList.add("slot-exit");
+    sl.el.classList.add(exitClass);
     const { el } = sl;
     setTimeout(() => el.remove(), 400);
   }
@@ -1134,18 +1183,79 @@ function cleanupMapStyle() {
 }
 
 // ---------- Permissions / sources ----------
+//
+// GPS flow. Runs in TWO stages to unstick users who are indoors or in a
+// street canyon, where a high-accuracy first fix can legitimately take
+// 20+ seconds:
+//
+//   Stage 1 — fast, cached, low-accuracy getCurrentPosition. Accepts a
+//             fix up to 5 minutes old. This is what makes the pane come
+//             alive within a second or two even with weak signal.
+//   Stage 2 — high-accuracy watchPosition. Long-running, refines the
+//             position as the browser gets better readings.
+//
+// An error surfaces to the UI only if we haven't landed ANY fix yet —
+// otherwise a stale-cache timeout on stage 1 would show an error while
+// stage 2 is still happily watching.
 function watchGps() {
-  navigator.geolocation.watchPosition(
-    (pos) => {
-      onPositionChange({
-        lat: pos.coords.latitude,
-        lon: pos.coords.longitude,
-        accuracy: pos.coords.accuracy,
-      });
-    },
-    (err) => showLocationError(err.message),
-    { enableHighAccuracy: true, maximumAge: 5_000, timeout: 20_000 }
-  );
+  // Treat a restored / manually-overridden position as already-a-fix: the
+  // UI is alive even before fresh GPS lands, so the "still trying…" hints
+  // shouldn't fire for returning users.
+  let firstFix = !!(userPos || manualOverride);
+  const onFix = (pos) => {
+    firstFix = true;
+    hideEmptyHint();
+    onPositionChange({
+      lat: pos.coords.latitude,
+      lon: pos.coords.longitude,
+      accuracy: pos.coords.accuracy,
+    });
+  };
+  const onErr = (err) => {
+    // Hard-fail only when we have literally no position at all.
+    if (!firstFix) showLocationError(err);
+  };
+
+  // Stage 1: fast, cached, low-accuracy. Permission prompt fires here on
+  // the first call. Timeout short so we advance to stage 2 quickly if the
+  // device has no cached fix.
+  try {
+    navigator.geolocation.getCurrentPosition(
+      onFix,
+      (err) => {
+        // PERMISSION_DENIED (code 1) is terminal — stage 2 will also fail,
+        // so surface now rather than waiting 30 s. Other codes are soft;
+        // stage 2 might still deliver a fix.
+        if (err && err.code === 1) onErr(err);
+      },
+      { enableHighAccuracy: false, maximumAge: 300_000, timeout: 8_000 }
+    );
+  } catch (e) { /* insecure context, etc. — let stage 2 surface the error */ }
+
+  // Stage 2: accurate, long-running watch.
+  try {
+    navigator.geolocation.watchPosition(
+      onFix, onErr,
+      { enableHighAccuracy: true, maximumAge: 5_000, timeout: 30_000 }
+    );
+  } catch (e) {
+    onErr({ message: e.message, code: 2 });
+  }
+
+  // Progressive feedback so the user knows we haven't frozen. Only fires
+  // if no fix has landed yet by the time each timeout elapses.
+  setTimeout(() => {
+    if (!firstFix) showEmptyHint("Still getting your location…\nThis can take a moment indoors.");
+  }, 5_000);
+  setTimeout(() => {
+    if (!firstFix) {
+      // Same defensive unhide as in showLocationError — the hint only helps
+      // if the minimap is actually visible, which normally depends on the
+      // async map-load callback finishing.
+      if (miniMap) miniMap.hidden = false;
+      showEmptyHint("Still trying…\nStep outside for a clearer sky, or tap the minimap to set your location manually.");
+    }
+  }, 15_000);
 }
 
 function installCompass() {
@@ -1153,27 +1263,52 @@ function installCompass() {
     typeof DeviceOrientationEvent !== "undefined" &&
     typeof DeviceOrientationEvent.requestPermission === "function";
 
-  // Single handler for both event variants — dedup so we don't fire twice on
-  // devices that support both (was a subtle cause of extra work).
+  // Heading handler, shared by both event variants.
+  //
+  // Platform matrix:
+  //   iOS Safari   — `deviceorientation` fires with `webkitCompassHeading`
+  //                  (true-north, degrees CW). Prefer this when present.
+  //   Android Chrome — `deviceorientationabsolute` fires with alpha in
+  //                    CCW-from-north. That event's `absolute` is always
+  //                    true by spec, so no flag check needed.
+  //   Android/other — plain `deviceorientation` may fire with alpha but
+  //                   `absolute: false` (gyro drift, no magnetometer
+  //                   reference). Using that as a heading would point
+  //                   the wrong way, so reject it.
   const handler = (e) => {
     let h = null;
     if (e.webkitCompassHeading != null) {
-      h = e.webkitCompassHeading;        // iOS: true-north, CW
+      h = e.webkitCompassHeading;
     } else if (e.alpha != null) {
-      h = (360 - e.alpha) % 360;         // Android: alpha is CCW from north
+      // Accept alpha only when the event is known-absolute: either the
+      // `deviceorientationabsolute` variant (always absolute) or a
+      // `deviceorientation` event that explicitly reports absolute.
+      const isAbsolute =
+        e.type === "deviceorientationabsolute" || e.absolute === true;
+      if (isAbsolute) h = (360 - e.alpha) % 360;
     }
-    if (h != null) onHeadingChange(h);
+    if (h != null) {
+      // Flip the "have a compass" flag on the first real event, NOT when
+      // the listener attaches. Some Android devices fire no events at all
+      // (no magnetometer, or permission silently ignored) and we need the
+      // slider fallback to still fire for them.
+      hasCompass = true;
+      onHeadingChange(h);
+    }
   };
 
+  // Attach both variants. On iOS only `deviceorientation` fires; on
+  // Android Chrome typically only `deviceorientationabsolute` does. The
+  // handler is idempotent so devices that somehow fire both (rare) are
+  // fine — we just get a slightly higher event rate, which onHeadingChange
+  // already throttles downstream.
   const listen = () => {
-    hasCompass = true;
-    // Prefer absolute (true-north) where available; otherwise deviceorientation
-    // (on iOS that's where webkitCompassHeading lives).
-    if ("ondeviceorientationabsolute" in window) {
-      window.addEventListener("deviceorientationabsolute", handler, true);
-    } else {
-      window.addEventListener("deviceorientation", handler);
-    }
+    window.addEventListener("deviceorientationabsolute", handler, true);
+    window.addEventListener("deviceorientation", handler, true);
+    // Slider fallback: if 2.5 s in we still haven't received a usable
+    // heading (device has no compass, or the page is served over http://
+    // where orientation is blocked), drop to manual heading control.
+    setTimeout(() => { if (!hasCompass) installSlider(); }, 2500);
   };
 
   if (needsIosPerm) {
@@ -1183,7 +1318,6 @@ function installCompass() {
     }).catch(() => installSlider("Compass unavailable — drag to change heading"));
   } else if ("DeviceOrientationEvent" in window) {
     listen();
-    setTimeout(() => { if (!hasCompass) installSlider(); }, 2000);
   } else {
     installSlider();
   }
@@ -1200,11 +1334,45 @@ function installSlider(reason = "No compass — drag to change heading") {
   onHeadingChange(heading);
 }
 
-function showLocationError(msg) {
+/**
+ * Surface a geolocation failure AND make the retry button tappable again.
+ * The "disabled=true" from the initial click used to persist through this
+ * path — a major cause of the "stuck on Getting your location…" reports.
+ * `err` is either a GeolocationPositionError (with .code) or a string.
+ */
+function showLocationError(err) {
+  const msg  = typeof err === "string" ? err : (err && err.message) || "Unknown error";
+  const code = err && typeof err === "object" ? err.code : null;
+
+  // CRITICAL: clear the disabled state. Previously this function left the
+  // button greyed out, so "Tap to try again" was a lie — the button
+  // couldn't actually be tapped.
   centerBtn.hidden = false;
-  startBtn.textContent = "Enable location";
+  startBtn.disabled = false;
+  startBtn.textContent = "Try again";
   startBtn.title = msg;
-  showEmptyHint("Couldn't get your location.\nTap the button to try again.");
+
+  // Make sure the manual-tap escape hatch is actually reachable. `initMap`
+  // normally unhides the minimap inside its `load` callback, which depends
+  // on async tile fetches — for code-1 (permission denied) the error often
+  // fires well before tiles arrive, leaving us telling the user to tap a
+  // hidden element. Force the container visible; pointer handlers are wired
+  // up synchronously in `bindMinimapInteraction`, so the tap works even if
+  // the GL canvas hasn't rendered tiles yet.
+  initMap();
+  if (miniMap) miniMap.hidden = false;
+
+  let hint;
+  if (code === 1) {         // PERMISSION_DENIED
+    hint = "Location permission denied.\nEnable it in your browser settings, or tap the minimap to set your location manually.";
+  } else if (code === 2) {  // POSITION_UNAVAILABLE
+    hint = "Couldn't get a location fix.\nStep outside and tap Try again, or tap the minimap to set your location manually.";
+  } else if (code === 3) {  // TIMEOUT
+    hint = "Location is taking too long.\nTap Try again, or tap the minimap to set your location manually.";
+  } else {
+    hint = "Couldn't get your location.\nTap Try again, or tap the minimap to set your location manually.";
+  }
+  showEmptyHint(hint);
 }
 
 // ---------- State persistence (localStorage) ----------
@@ -1272,8 +1440,13 @@ startBtn.addEventListener("click", () => {
   startBtn.textContent = "Getting location…";
   startBtn.disabled = true;
 
-  // Immediate empty-hint so the black pane doesn't look broken.
-  showEmptyHint("Getting your location…");
+  // Only override the boot hint ("Point your phone at a building…") if
+  // we don't already have a position. Returning users who have a saved
+  // position shouldn't be shown "Getting your location…" — they already
+  // have one, what they're waiting for is a heading / candidate scan.
+  if (!userPos && !manualOverride) {
+    showEmptyHint("Getting your location…");
+  }
 
   watchGps();
   installCompass();
